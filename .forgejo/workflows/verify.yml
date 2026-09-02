@@ -1,0 +1,28 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paper-plasma-verify-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+jobs:
+  required:
+    name: Forgejo / Paper Plasma x86_64-linux required
+    runs-on: skwd-paper-ci
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Build and verify the package stage
+        run: scripts/test-all.sh

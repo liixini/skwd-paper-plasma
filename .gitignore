@@ -1,0 +1,5 @@
+/build/
+/.skwd-package/
+/ci-artifacts/
+__pycache__/
+*.py[cod]

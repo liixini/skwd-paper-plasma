@@ -1,0 +1,6 @@
+usr/lib/qt6/qml/org/skwd/wallpaper/libskwdwallpaperplugin.so
+usr/lib/qt6/qml/org/skwd/wallpaper/qmldir
+usr/share/licenses/skwd-paper-plasma/LICENSE
+usr/share/plasma/wallpapers/org.skwd.wall.plasma/contents/config/main.xml
+usr/share/plasma/wallpapers/org.skwd.wall.plasma/contents/ui/main.qml
+usr/share/plasma/wallpapers/org.skwd.wall.plasma/metadata.json
