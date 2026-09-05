@@ -1,6 +1,10 @@
 #include "skwdvideoitem.h"
 
 #include <QImage>
+#include <QDir>
+#include <QFile>
+#include <QSaveFile>
+#include <QStandardPaths>
 #include <QDebug>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -19,6 +23,7 @@
 #include <GL/gl.h>
 #include <drm_fourcc.h>
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -217,18 +222,21 @@ SkwdVideoItem::SkwdVideoItem(QQuickItem *parent)
     setFlag(ItemHasContents, true);
     m_process.setProcessChannelMode(QProcess::SeparateChannels);
     connect(&m_process, &QProcess::readyReadStandardOutput, this, &SkwdVideoItem::consume);
-    connect(&m_process, &QProcess::readyReadStandardError, this, [this] {
-        m_process.readAllStandardError();
+    connect(&m_process, &QProcess::readyReadStandardError, this, &SkwdVideoItem::collectErrors);
+    connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            failPresentation(QStringLiteral("Cannot start %1: %2").arg(m_paper, m_process.errorString()));
+        }
     });
-    connect(&m_process, &QProcess::finished, this, [this] {
+    connect(&m_process, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
         if (m_stopping || m_destroying || m_assignment.isEmpty()) {
             return;
         }
-        QTimer::singleShot(1000, this, [this] {
-            if (!m_destroying && m_process.state() == QProcess::NotRunning && !m_assignment.isEmpty()) {
-                scheduleRestart();
-            }
-        });
+        collectErrors();
+        if (code != 0 || status != QProcess::NormalExit || !m_workerReady) {
+            failPresentation(QStringLiteral("Wallpaper renderer exited (%1): %2")
+                .arg(code).arg(QString::fromUtf8(m_stderr).trimmed()));
+        }
     });
 }
 
@@ -242,6 +250,105 @@ SkwdVideoItem::~SkwdVideoItem()
         m_process.kill();
         m_process.waitForFinished(500);
     }
+}
+
+QString SkwdVideoItem::presentationId() const
+{
+    return m_presentationId;
+}
+
+void SkwdVideoItem::setPresentationId(const QString &value)
+{
+    if (m_presentationId == value) {
+        return;
+    }
+    m_presentationId = value;
+    emit presentationIdChanged();
+    if (!m_error.isEmpty() && isComponentComplete()) {
+        scheduleRestart();
+    }
+    QTimer::singleShot(0, this, [this] {
+        if (!m_restartRequired) {
+            reportPresentation();
+        }
+    });
+}
+
+void SkwdVideoItem::collectErrors()
+{
+    m_stderr.append(m_process.readAllStandardError());
+    m_stderr = m_stderr.right(8192);
+}
+
+void SkwdVideoItem::failPresentation(const QString &error)
+{
+    if (m_stopping || m_destroying || !m_error.isEmpty()) {
+        return;
+    }
+    qWarning().noquote() << "skwd-paper-plasma:" << error;
+    const QString marker = QStringLiteral("exited with error: ");
+    const auto detail = error.lastIndexOf(marker);
+    m_error = (detail >= 0 ? error.mid(detail + marker.size()) : error).left(2048).trimmed();
+    reportPresentation();
+    if (m_process.state() != QProcess::NotRunning) {
+        m_process.kill();
+    }
+}
+
+void SkwdVideoItem::reportPresentation()
+{
+    if (m_presentationId.isEmpty() || m_presentationId.size() > 100
+        || std::any_of(m_presentationId.begin(), m_presentationId.end(), [](QChar ch) {
+            return (ch < QLatin1Char('0') || ch > QLatin1Char('9')) && ch != QLatin1Char('-');
+        })) {
+        return;
+    }
+    if (m_error.isEmpty() && (!m_workerReady || !m_frameAccepted)) {
+        return;
+    }
+    const QString path = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation)
+        + QStringLiteral("/skwd-paper-plasma/") + m_presentationId + QStringLiteral(".json");
+    if (!QFile::exists(path)) {
+        return;
+    }
+    QJsonObject status;
+    status.insert(QStringLiteral("state"), m_error.isEmpty() ? QStringLiteral("ready") : QStringLiteral("error"));
+    status.insert(QStringLiteral("error"), m_error);
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)
+        || file.write(QJsonDocument(status).toJson(QJsonDocument::Compact)) < 0
+        || !file.commit()) {
+        qWarning() << "skwd-paper-plasma: cannot report presentation:" << file.errorString();
+    }
+}
+
+void SkwdVideoItem::frameAccepted()
+{
+    const auto generation = m_streamGeneration;
+    if (m_frameQueuedGeneration == generation) {
+        return;
+    }
+    m_frameQueuedGeneration = generation;
+    QMetaObject::invokeMethod(this, [this, generation] {
+        if (generation == m_streamGeneration) {
+            m_frameAccepted = true;
+            reportPresentation();
+        }
+    }, Qt::QueuedConnection);
+}
+
+void SkwdVideoItem::frameFailed(const QString &error)
+{
+    const auto generation = m_streamGeneration;
+    if (m_errorQueuedGeneration == generation) {
+        return;
+    }
+    m_errorQueuedGeneration = generation;
+    QMetaObject::invokeMethod(this, [this, generation, error] {
+        if (generation == m_streamGeneration) {
+            failPresentation(error);
+        }
+    }, Qt::QueuedConnection);
 }
 
 QString SkwdVideoItem::assignment() const
@@ -418,6 +525,10 @@ void SkwdVideoItem::restart()
     closeDmabuf();
     m_stopping = false;
     m_buffer.clear();
+    m_stderr.clear();
+    m_error.clear();
+    m_workerReady = false;
+    m_frameAccepted = false;
     m_headerWidth = 0;
     m_headerHeight = 0;
     {
@@ -434,6 +545,7 @@ void SkwdVideoItem::restart()
     }
     int sockets[2];
     if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
+        failPresentation(QStringLiteral("Cannot create the wallpaper frame socket"));
         return;
     }
     m_socket = sockets[0];
@@ -477,9 +589,15 @@ void SkwdVideoItem::consumeDmabuf()
             return;
         }
         if (length <= 0) {
+            m_socketNotifier->setEnabled(false);
             return;
         }
         if (length < 6 || std::memcmp(bytes.data(), "SKDG", 4) != 0) {
+            continue;
+        }
+        if (bytes[4] == 6 && length == 32) {
+            m_workerReady = true;
+            reportPresentation();
             continue;
         }
         const int slotIndex = bytes[5];
@@ -543,14 +661,14 @@ void SkwdVideoItem::consume()
             return;
         }
         if (m_buffer.first(4) != QByteArrayLiteral("SKWP")) {
-            m_process.kill();
+            failPresentation(QStringLiteral("Wallpaper renderer sent an invalid frame header"));
             return;
         }
         const auto *header = reinterpret_cast<const uchar *>(m_buffer.constData() + 4);
         const quint32 width = qFromLittleEndian<quint32>(header);
         const quint32 height = qFromLittleEndian<quint32>(header + 4);
         if (width == 0 || height == 0 || width > 7680 || height > 4320) {
-            m_process.kill();
+            failPresentation(QStringLiteral("Wallpaper renderer sent an invalid frame size"));
             return;
         }
         m_frameBytes = qsizetype(width) * qsizetype(height) * 4;
@@ -608,6 +726,7 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         }
         if (imported) {
             if (!node->wait(pending)) {
+                frameFailed(QStringLiteral("Cannot wait for the wallpaper GPU frame"));
                 acknowledge(pending);
                 return node;
             }
@@ -619,9 +738,11 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             node->setOwnsTexture(false);
             node->currentSlot = pending;
             node->generation = generation;
+            frameAccepted();
             return node;
         }
         acknowledge(pending);
+        frameFailed(QStringLiteral("Cannot import the wallpaper GPU frame on this graphics device"));
     }
     QByteArray frame;
     int frameWidth;
@@ -648,8 +769,13 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         return node;
     }
     QSGTexture *texture = window()->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
+    if (!texture) {
+        frameFailed(QStringLiteral("Cannot upload the wallpaper frame"));
+        return node;
+    }
     node->setTexture(texture);
     node->setOwnsTexture(true);
     node->generation = generation;
+    frameAccepted();
     return node;
 }

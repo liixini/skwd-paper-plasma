@@ -21,6 +21,7 @@ WallpaperItem {
 
     SkwdVideoItem {
         anchors.fill: parent
+        presentationId: root.currentAssignment ? (root.currentAssignment.presentationId || "") : ""
         assignment: root.currentAssignment
             ? JSON.stringify(root.currentAssignment.assignment)
             : (configuration.Assignment || "")

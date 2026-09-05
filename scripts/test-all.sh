@@ -8,3 +8,5 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 python3 -m unittest discover -s "$root/scripts/tests"
 SKWD_PLASMA_BUILD_DIR=$temporary/build \
     "$root/scripts/package-stage.sh" "$temporary/stage"
+
+ctest --test-dir "$temporary/build" --output-on-failure

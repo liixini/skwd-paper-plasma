@@ -10,6 +10,7 @@ class QSocketNotifier;
 
 class SkwdVideoItem : public QQuickItem {
     Q_OBJECT
+    Q_PROPERTY(QString presentationId READ presentationId WRITE setPresentationId NOTIFY presentationIdChanged)
     Q_PROPERTY(QString assignment READ assignment WRITE setAssignment NOTIFY assignmentChanged)
     Q_PROPERTY(QString paper READ paper WRITE setPaper NOTIFY paperChanged)
     Q_PROPERTY(int streamWidth READ streamWidth WRITE setStreamWidth NOTIFY streamSizeChanged)
@@ -21,6 +22,8 @@ public:
     explicit SkwdVideoItem(QQuickItem *parent = nullptr);
     ~SkwdVideoItem() override;
 
+    QString presentationId() const;
+    void setPresentationId(const QString &value);
     QString assignment() const;
     void setAssignment(const QString &value);
     QString paper() const;
@@ -35,6 +38,7 @@ public:
     void setPaused(bool value);
 
 signals:
+    void presentationIdChanged();
     void assignmentChanged();
     void paperChanged();
     void streamSizeChanged();
@@ -66,7 +70,19 @@ private:
     void consumeDmabuf();
     void closeDmabuf();
     void acknowledge(int slot);
+    void collectErrors();
+    void failPresentation(const QString &error);
+    void reportPresentation();
+    void frameAccepted();
+    void frameFailed(const QString &error);
 
+    QString m_presentationId;
+    QByteArray m_stderr;
+    QString m_error;
+    bool m_workerReady = false;
+    bool m_frameAccepted = false;
+    quint64 m_frameQueuedGeneration = 0;
+    quint64 m_errorQueuedGeneration = 0;
     QString m_assignment;
     QString m_paper = QStringLiteral("/usr/bin/skwd-paper-v2");
     int m_streamWidth = 1280;
