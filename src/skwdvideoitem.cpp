@@ -1,6 +1,8 @@
 #include "skwdvideoitem.h"
 
 #include <QImage>
+#include <QProcessEnvironment>
+#include <QSGRendererInterface>
 #include <QDir>
 #include <QFile>
 #include <QSaveFile>
@@ -511,11 +513,21 @@ void SkwdVideoItem::closeDmabuf()
         }
         slot = {};
     }
-    m_pendingSlot = -1;
+    m_pendingSlots.clear();
 }
 
 void SkwdVideoItem::restart()
 {
+    if (!m_deviceKnown) {
+        // Software scene-graph tests and CPU-only sessions need no GL device.
+        if (window() && window()->rendererInterface()->graphicsApi() == QSGRendererInterface::Software) {
+            m_deviceKnown = true;
+        } else {
+            update();
+            return;
+        }
+    }
+    m_epoch = 0;
     ++m_streamGeneration;
     m_stopping = true;
     if (m_process.state() != QProcess::NotRunning) {
@@ -569,6 +581,16 @@ void SkwdVideoItem::restart()
     if (m_paused) {
         arguments.append(QStringLiteral("--paused"));
     }
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_GPU_STREAM"), m_deviceUuid.isEmpty() ? QStringLiteral("0") : QStringLiteral("1"));
+    if (!m_deviceUuid.isEmpty()) {
+        environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_DEVICE_UUID"), QString::fromLatin1(m_deviceUuid));
+        environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_DRIVER_UUID"), QString::fromLatin1(m_driverUuid));
+    } else {
+        environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DEVICE_UUID"));
+        environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DRIVER_UUID"));
+    }
+    m_process.setProcessEnvironment(environment);
     m_process.start(m_paper, arguments);
     ::close(childSocket);
 }
@@ -592,9 +614,30 @@ void SkwdVideoItem::consumeDmabuf()
             m_socketNotifier->setEnabled(false);
             return;
         }
-        if (length < 6 || std::memcmp(bytes.data(), "SKDG", 4) != 0) {
+        if (length != 32 || std::memcmp(bytes.data(), "SKDG", 4) != 0) {
             continue;
         }
+        const quint16 epoch = qFromLittleEndian<quint16>(bytes.data() + 6);
+        if (bytes[4] == 7 && length == 32) {
+            QMutexLocker lock(&m_frameMutex);
+            for (auto &slot : m_slots) {
+                if (slot.fd >= 0) ::close(slot.fd);
+                if (slot.semaphoreFd >= 0) ::close(slot.semaphoreFd);
+                slot = {};
+            }
+            m_pendingSlots.clear();
+            m_frame.clear();
+            m_buffer.clear();
+            m_ready = false;
+            m_epoch = epoch;
+            ++m_streamGeneration;
+            m_workerReady = false;
+            m_frameAccepted = false;
+            bytes[4] = 8;
+            ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+            continue;
+        }
+        if (epoch != m_epoch) continue;
         if (bytes[4] == 6 && length == 32) {
             m_workerReady = true;
             reportPresentation();
@@ -626,15 +669,10 @@ void SkwdVideoItem::consumeDmabuf()
             slot.modifier = read64(bytes.data() + 24);
             slot.opaque = bytes[4] == 4;
         } else if (bytes[4] == 2) {
-            int skipped = -1;
             {
                 QMutexLocker lock(&m_frameMutex);
-                skipped = m_pendingSlot;
-                m_pendingSlot = slotIndex;
+                m_pendingSlots.push_back(slotIndex);
                 ++m_generation;
-            }
-            if (skipped >= 0) {
-                acknowledge(skipped);
             }
             update();
         }
@@ -650,6 +688,7 @@ void SkwdVideoItem::acknowledge(int slot)
     std::memcpy(bytes.data(), "SKDG", 4);
     bytes[4] = 3;
     bytes[5] = uchar(slot);
+    qToLittleEndian(m_epoch, bytes.data() + 6);
     ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL);
 }
 
@@ -693,17 +732,47 @@ void SkwdVideoItem::consume()
 
 QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
+    if (!m_deviceKnown) {
+        QByteArray uuid, driver;
+        if (auto *context = QOpenGLContext::currentContext()) {
+            auto getIndexed = reinterpret_cast<PFNGLGETUNSIGNEDBYTEI_VEXTPROC>(context->getProcAddress("glGetUnsignedBytei_vEXT"));
+            auto get = reinterpret_cast<PFNGLGETUNSIGNEDBYTEVEXTPROC>(context->getProcAddress("glGetUnsignedBytevEXT"));
+            if (getIndexed && get
+                && context->hasExtension(QByteArrayLiteral("GL_EXT_memory_object"))
+                && context->hasExtension(QByteArrayLiteral("GL_EXT_memory_object_fd"))
+                && context->hasExtension(QByteArrayLiteral("GL_EXT_semaphore"))
+                && context->hasExtension(QByteArrayLiteral("GL_EXT_semaphore_fd"))) {
+                GLint count = 0;
+                glGetIntegerv(GL_NUM_DEVICE_UUIDS_EXT, &count);
+                if (count == 1) {
+                    std::array<GLubyte, 16> bytes {};
+                    getIndexed(GL_DEVICE_UUID_EXT, 0, bytes.data());
+                    uuid = QByteArray(reinterpret_cast<const char *>(bytes.data()), bytes.size()).toHex();
+                    get(GL_DRIVER_UUID_EXT, bytes.data());
+                    driver = QByteArray(reinterpret_cast<const char *>(bytes.data()), bytes.size()).toHex();
+                    if (glGetError() != GL_NO_ERROR) { uuid.clear(); driver.clear(); }
+                }
+            }
+        }
+        m_deviceKnown = true;
+        QMetaObject::invokeMethod(this, [this, uuid, driver] {
+            m_deviceUuid = uuid;
+            m_driverUuid = driver;
+            qInfo() << "skwd-paper-plasma: shared-image device" << uuid;
+            scheduleRestart();
+        }, Qt::QueuedConnection);
+    }
     auto *node = static_cast<SkwdFrameNode *>(oldNode);
-    int pending = -1;
+    std::vector<int> pendingSlots;
     quint64 generation;
     bool hasCpuFrame;
     {
         QMutexLocker lock(&m_frameMutex);
         generation = m_generation;
-        pending = m_pendingSlot;
-        m_pendingSlot = -1;
+        pendingSlots.swap(m_pendingSlots);
         hasCpuFrame = !m_frame.isEmpty();
     }
+    const int pending = pendingSlots.empty() ? -1 : pendingSlots.back();
     if (node && node->streamGeneration != m_streamGeneration && (pending >= 0 || hasCpuFrame)) {
         delete node;
         node = nullptr;
@@ -719,30 +788,42 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     }
     node->setRect(boundingRect());
     if (pending >= 0) {
-        bool imported;
-        {
-            QMutexLocker lock(&m_frameMutex);
-            imported = node->import(pending, m_slots[pending], window());
-        }
-        if (imported) {
-            if (!node->wait(pending)) {
-                frameFailed(QStringLiteral("Cannot wait for the wallpaper GPU frame"));
-                acknowledge(pending);
+        // A dropped frame still owns a signaled binary semaphore. Consume every
+        // signal on the render thread before allowing the producer to reuse its
+        // slot; acknowledging a skipped frame from the GUI thread can otherwise
+        // cause Vulkan to signal the same semaphore twice and stall the queue.
+        for (int slot : pendingSlots) {
+            bool imported;
+            {
+                QMutexLocker lock(&m_frameMutex);
+                imported = node->import(slot, m_slots[slot], window());
+            }
+            if (!imported) {
+                frameFailed(QStringLiteral("Cannot import the wallpaper GPU frame on this graphics device"));
                 return node;
             }
+            if (!node->wait(slot)) {
+                frameFailed(QStringLiteral("Cannot wait for the wallpaper GPU frame"));
+                return node;
+            }
+        }
+        if (node->currentSlot >= 0 || pendingSlots.size() > 1) {
+            glFinish();
             if (node->currentSlot >= 0 && node->currentSlot != pending) {
-                glFinish();
                 acknowledge(node->currentSlot);
             }
-            node->setTexture(node->textures[pending].texture);
-            node->setOwnsTexture(false);
-            node->currentSlot = pending;
-            node->generation = generation;
-            frameAccepted();
-            return node;
+            for (int slot : pendingSlots) {
+                if (slot != pending) {
+                    acknowledge(slot);
+                }
+            }
         }
-        acknowledge(pending);
-        frameFailed(QStringLiteral("Cannot import the wallpaper GPU frame on this graphics device"));
+        node->setTexture(node->textures[pending].texture);
+        node->setOwnsTexture(false);
+        node->currentSlot = pending;
+        node->generation = generation;
+        frameAccepted();
+        return node;
     }
     QByteArray frame;
     int frameWidth;

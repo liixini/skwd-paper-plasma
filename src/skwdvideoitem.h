@@ -5,6 +5,7 @@
 #include <QProcess>
 #include <QQuickItem>
 #include <array>
+#include <vector>
 
 class QSocketNotifier;
 
@@ -104,9 +105,13 @@ private:
     std::array<DmabufSlot, 3> m_slots;
     QSocketNotifier *m_socketNotifier = nullptr;
     int m_socket = -1;
-    int m_pendingSlot = -1;
+    std::vector<int> m_pendingSlots;
     qsizetype m_frameBytes = 0;
     quint64 m_generation = 0;
     quint64 m_streamGeneration = 0;
+    quint16 m_epoch = 0;
+    bool m_deviceKnown = false;
+    QByteArray m_deviceUuid;
+    QByteArray m_driverUuid;
     bool m_ready = false;
 };

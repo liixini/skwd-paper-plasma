@@ -30,6 +30,25 @@ int main(int argc, char **argv)
     helper.write(R"PY(#!/usr/bin/python3
 import os, socket, struct, sys
 mode = sys.argv[sys.argv.index('--assignment') + 1]
+if mode == 'burst':
+    stream = socket.socket(fileno=3)
+    for slot in range(3):
+        stream.send(b'SKDG' + bytes([2, slot]) + bytes(26))
+    stream.settimeout(0.2)
+    try:
+        stream.recv(32)
+        sys.stderr.write('acknowledged before rendering\n')
+    except TimeoutError:
+        sys.stderr.write('held until rendering\n')
+    sys.exit(2)
+if mode in ('epochs', 'stale'):
+    stream = socket.socket(fileno=3)
+    def packet(kind, epoch):
+        return b'SKDG' + bytes([kind, 0]) + struct.pack('<H',epoch) + bytes(24)
+    for epoch in (1, 2):
+        stream.send(packet(7, epoch))
+        assert stream.recv(32) == packet(8, epoch)
+    stream.send(packet(6, 1 if mode == 'stale' else 2))
 if mode == 'fail':
     sys.stderr.write('synthetic export unavailable\n')
     sys.exit(2)
@@ -37,6 +56,8 @@ if mode == 'ready':
     socket.socket(fileno=3).send(b'SKDG' + bytes([6]) + bytes(27))
 sys.stdout.buffer.write(b'SKWP' + struct.pack('<II',16,16) + bytes([255,0,0,255])*256)
 sys.stdout.buffer.flush()
+if mode == 'stale':
+    sys.exit(0)
 if mode == 'prelude':
     sys.stderr.write('failed after transition prelude\n')
     sys.exit(3)
@@ -48,7 +69,6 @@ sys.stdin.read()
     item.setSize(QSizeF(32,32));
     item.setPaper(helper.fileName());
     item.componentComplete();
-    window.show();
     int request = 0;
     auto check = [&](const QString &assignment, const QString &expected, const QString &detail = QString()) {
         const QString id = QStringLiteral("123-1-%1").arg(++request);
@@ -74,8 +94,16 @@ sys.stdin.read()
         if (!ok) std::cerr << "presentation " << assignment.toStdString() << ": " << QJsonDocument(status).toJson().toStdString();
         return ok;
     };
+    // A hidden item cannot consume GPU semaphore signals. Even when several
+    // frames arrive, none may be returned to the producer from the GUI thread.
+    item.setVisible(false);
+    if (!check("burst", "error", "held until rendering")) return 7;
+    item.setVisible(true);
+    window.show();
     if (!check("ready", "ready")) return 2;
     if (!check("ready", "ready")) return 3;
+    if (!check("epochs", "ready")) return 8;
+    if (!check("stale", "error", "Wallpaper renderer exited")) return 9;
     if (!check("fail", "error", "synthetic export unavailable")) return 4;
     if (!check("prelude", "error", "failed after transition prelude")) return 5;
     item.setPaper(runtime.path() + "/missing");
