@@ -29,10 +29,12 @@ WallpaperItem {
             ? root.currentAssignment.paper
             : (configuration.Paper || "skwd-paper-v2")
         streamWidth: root.width > 0
-            ? Math.round(root.width * Math.max(1, Screen.devicePixelRatio))
+            ? Math.min(Math.round(root.width * Math.max(1, Screen.devicePixelRatio)),
+                       root.currentAssignment ? root.currentAssignment.width : Infinity)
             : (root.currentAssignment ? root.currentAssignment.width : (configuration.StreamWidth || 1920))
         streamHeight: root.height > 0
-            ? Math.round(root.height * Math.max(1, Screen.devicePixelRatio))
+            ? Math.min(Math.round(root.height * Math.max(1, Screen.devicePixelRatio)),
+                       root.currentAssignment ? root.currentAssignment.height : Infinity)
             : (root.currentAssignment ? root.currentAssignment.height : (configuration.StreamHeight || 1080))
         streamFps: Screen.refreshRate > 0
             ? Math.min(root.currentAssignment ? root.currentAssignment.fps : (configuration.StreamFps || 30), Math.round(Screen.refreshRate))
