@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Window
 import org.kde.plasma.plasmoid
 import org.skwd.wallpaper 1.0
+import org.kde.taskmanager as TaskManager
 
 WallpaperItem {
     id: root
@@ -18,6 +19,26 @@ WallpaperItem {
 
     property var assignments: parseAssignments(configuration.Assignments || "")
     property var currentAssignment: assignments[Screen.name] || null
+
+    TaskManager.VirtualDesktopInfo { id: desktopInfo }
+    TaskManager.ActivityInfo { id: activityInfo }
+    TaskManager.TasksModel {
+        id: windowTasks
+        groupMode: TaskManager.TasksModel.GroupDisabled
+        filterByVirtualDesktop: true
+        virtualDesktop: desktopInfo.currentDesktop
+        filterByActivity: true
+        activity: activityInfo.currentActivity
+        filterByScreen: true
+        screenGeometry: Qt.rect(root.Screen.virtualX, root.Screen.virtualY, root.Screen.width, root.Screen.height)
+        filterMinimized: true
+        filterHidden: true
+    }
+    SkwdWindowMonitor {
+        id: windowMonitor
+        model: windowTasks
+        output: root.Screen.name
+    }
 
     SkwdVideoItem {
         anchors.fill: parent
@@ -39,7 +60,11 @@ WallpaperItem {
         streamFps: Screen.refreshRate > 0
             ? Math.min(root.currentAssignment ? root.currentAssignment.fps : (configuration.StreamFps || 30), Math.round(Screen.refreshRate))
             : (root.currentAssignment ? root.currentAssignment.fps : (configuration.StreamFps || 30))
-        paused: root.currentAssignment ? root.currentAssignment.paused : (configuration.Paused || false)
+        paused: windowMonitor.hasPolicy ? windowMonitor.paused
+            : (root.currentAssignment
+                ? (typeof root.currentAssignment.manualPaused === "boolean"
+                    ? root.currentAssignment.manualPaused : root.currentAssignment.paused)
+                : (configuration.Paused || false))
     }
 
     Component.onCompleted: root.loading = false

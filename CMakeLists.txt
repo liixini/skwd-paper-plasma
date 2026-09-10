@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
-find_package(Qt6 REQUIRED COMPONENTS Core Gui OpenGL Qml Quick)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network OpenGL Qml Quick)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 
@@ -14,9 +14,11 @@ add_library(skwdwallpaperplugin MODULE
     src/plugin.cpp
     src/skwdvideoitem.cpp
     src/skwdvideoitem.h
+    src/skwdwindowmonitor.cpp
+    src/skwdwindowmonitor.h
 )
 
-target_link_libraries(skwdwallpaperplugin PRIVATE Qt6::Core Qt6::Gui Qt6::OpenGL Qt6::Qml Qt6::Quick EGL PkgConfig::LIBDRM)
+target_link_libraries(skwdwallpaperplugin PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::OpenGL Qt6::Qml Qt6::Quick EGL PkgConfig::LIBDRM)
 
 set(SKWD_QML_DIR "${CMAKE_INSTALL_LIBDIR}/qt6/qml/org/skwd/wallpaper")
 set(SKWD_LICENSE_DIR "${CMAKE_INSTALL_DATADIR}/licenses/skwd-paper-plasma")
@@ -27,6 +29,11 @@ install(FILES LICENSE DESTINATION "${SKWD_LICENSE_DIR}")
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(window-state-test scripts/tests/window-state.cpp src/skwdwindowmonitor.cpp src/skwdwindowmonitor.h)
+    target_include_directories(window-state-test PRIVATE src)
+    target_link_libraries(window-state-test PRIVATE Qt6::Core Qt6::Network)
+    add_test(NAME window-state COMMAND window-state-test)
+    set_tests_properties(window-state PROPERTIES TIMEOUT 20)
     add_executable(presentation-test scripts/tests/presentation.cpp src/skwdvideoitem.cpp src/skwdvideoitem.h)
     target_include_directories(presentation-test PRIVATE src)
     target_link_libraries(presentation-test PRIVATE Qt6::Core Qt6::Gui Qt6::OpenGL Qt6::Qml Qt6::Quick EGL PkgConfig::LIBDRM)

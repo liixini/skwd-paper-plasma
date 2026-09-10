@@ -1,4 +1,5 @@
 #include "skwdvideoitem.h"
+#include "skwdwindowmonitor.h"
 
 #include <QQmlExtensionPlugin>
 #include <qqml.h>
@@ -11,6 +12,7 @@ public:
     void registerTypes(const char *uri) override
     {
         qmlRegisterType<SkwdVideoItem>(uri, 1, 0, "SkwdVideoItem");
+        qmlRegisterType<SkwdWindowMonitor>(uri, 1, 0, "SkwdWindowMonitor");
     }
 };
 
