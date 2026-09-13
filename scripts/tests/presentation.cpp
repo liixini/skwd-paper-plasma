@@ -244,7 +244,7 @@ sys.stdin.read()
     QFile legacyHelper(runtime.path() + "/legacy-presenter");
     if (!legacyHelper.open(QIODevice::WriteOnly)) return 25;
     QFile source(helper.fileName());
-    source.open(QIODevice::ReadOnly);
+    if (!source.open(QIODevice::ReadOnly)) return 28;
     legacyHelper.write(source.readAll());
     legacyHelper.close();
     legacyHelper.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);

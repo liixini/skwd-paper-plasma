@@ -304,7 +304,7 @@ void SkwdVideoItem::failPresentation(const QString &error)
 
 void SkwdVideoItem::reportPresentation()
 {
-    if (m_presentationId.isEmpty() || m_presentationId.size() > 100
+    if (m_restartRequired || m_presentationId.isEmpty() || m_presentationId.size() > 100
         || std::any_of(m_presentationId.begin(), m_presentationId.end(), [](QChar ch) {
             return (ch < QLatin1Char('0') || ch > QLatin1Char('9')) && ch != QLatin1Char('-');
         })) {
