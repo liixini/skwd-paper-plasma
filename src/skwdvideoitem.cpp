@@ -1,4 +1,5 @@
 #include "skwdvideoitem.h"
+#include "skwdworkerpool.h"
 
 #include <QImage>
 #include <QProcessEnvironment>
@@ -246,6 +247,10 @@ SkwdVideoItem::~SkwdVideoItem()
 {
     m_destroying = true;
     m_stopping = true;
+    if (m_pooled) {
+        m_pooled = false;
+        SkwdWorkerPool::instance()->detach(this);
+    }
     closeDmabuf();
     m_process.terminate();
     if (!m_process.waitForFinished(500)) {
@@ -490,9 +495,155 @@ void SkwdVideoItem::sendControl(const QByteArray &line)
 void SkwdVideoItem::sendPause()
 {
     QJsonObject command;
-    command.insert(QStringLiteral("to"), QString());
+    command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
     command.insert(QStringLiteral("pause"), m_paused);
-    sendControl(QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n');
+    const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
+    if (m_pooled) {
+        if (!SkwdWorkerPool::instance()->sendControl(this, line)) {
+            scheduleRestart();
+        }
+        return;
+    }
+    sendControl(line);
+}
+
+QString SkwdVideoItem::output() const
+{
+    return m_output;
+}
+
+void SkwdVideoItem::setOutput(const QString &value)
+{
+    if (m_output == value) {
+        return;
+    }
+    m_output = value;
+    emit outputChanged();
+    if (isComponentComplete()) {
+        scheduleRestart();
+    }
+}
+
+bool SkwdVideoItem::poolEligible() const
+{
+    if (m_output.isEmpty() || m_assignment.isEmpty() || m_paper.isEmpty()
+        || SkwdWorkerPool::instance()->legacyPresenter(m_paper)) {
+        return false;
+    }
+    const auto source = QJsonDocument::fromJson(m_assignment.toUtf8()).object().value(QStringLiteral("source")).toObject();
+    const QString kind = source.value(QStringLiteral("kind")).toString();
+    if (kind == QStringLiteral("static")) {
+        return true;
+    }
+    if (m_deviceUuid.isEmpty()) {
+        return false;
+    }
+    if (kind == QStringLiteral("video")) {
+        return source.value(QStringLiteral("engine")).toString() != QStringLiteral("tinier");
+    }
+    return kind == QStringLiteral("we");
+}
+
+bool SkwdVideoItem::sharesWorker() const
+{
+    return m_pooled;
+}
+
+bool SkwdVideoItem::workerReady() const
+{
+    return m_workerReady;
+}
+
+QByteArray SkwdVideoItem::workerKey() const
+{
+    QJsonObject assignment = QJsonDocument::fromJson(m_assignment.toUtf8()).object();
+    assignment.remove(QStringLiteral("outputs"));
+    return m_paper.toUtf8() + '\n' + m_deviceUuid + '\n'
+        + QJsonDocument(assignment).toJson(QJsonDocument::Compact);
+}
+
+SkwdVideoItem::StreamSpec SkwdVideoItem::streamSpec() const
+{
+    const auto source = QJsonDocument::fromJson(m_assignment.toUtf8()).object().value(QStringLiteral("source")).toObject();
+    const bool cpuFrames = source.value(QStringLiteral("kind")).toString() == QStringLiteral("static");
+    return {m_streamWidth, m_streamHeight, m_streamFps, m_output, m_paused, cpuFrames};
+}
+
+int SkwdVideoItem::beginSharedFrames()
+{
+    int pipes[2];
+    if (::pipe2(pipes, O_CLOEXEC) != 0) {
+        failPresentation(QStringLiteral("Cannot create the wallpaper frame pipe"));
+        return -1;
+    }
+    m_frameSocket = pipes[0];
+    const int flags = ::fcntl(m_frameSocket, F_GETFL, 0);
+    ::fcntl(m_frameSocket, F_SETFL, flags | O_NONBLOCK);
+    m_frameNotifier = new QSocketNotifier(m_frameSocket, QSocketNotifier::Read, this);
+    connect(m_frameNotifier, &QSocketNotifier::activated, this, &SkwdVideoItem::readFrames);
+    return pipes[1];
+}
+
+void SkwdVideoItem::readFrames()
+{
+    QByteArray bytes;
+    std::array<char, 65536> chunk {};
+    for (;;) {
+        const ssize_t length = ::read(m_frameSocket, chunk.data(), chunk.size());
+        if (length > 0) {
+            bytes.append(chunk.data(), length);
+            continue;
+        }
+        if (length < 0 && errno == EINTR) {
+            continue;
+        }
+        if (length == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            m_frameNotifier->setEnabled(false);
+        }
+        break;
+    }
+    if (!bytes.isEmpty()) {
+        consumeFrames(bytes);
+    }
+}
+
+QByteArray SkwdVideoItem::sharedImageDevice() const
+{
+    return m_deviceUuid;
+}
+
+QByteArray SkwdVideoItem::sharedImageDriver() const
+{
+    return m_driverUuid;
+}
+
+void SkwdVideoItem::setSharedImageDevice(const QByteArray &uuid, const QByteArray &driver)
+{
+    m_deviceUuid = uuid;
+    m_driverUuid = driver;
+    m_deviceKnown = true;
+}
+
+int SkwdVideoItem::beginSharedStream()
+{
+    resetStream();
+    return openStream();
+}
+
+void SkwdVideoItem::sharedWorkerFailed(const QString &error)
+{
+    failPresentation(error);
+}
+
+void SkwdVideoItem::sharedWorkerFinished(int code, QProcess::ExitStatus status, const QByteArray &errors)
+{
+    if (m_stopping || m_destroying || m_assignment.isEmpty()) {
+        return;
+    }
+    if (code != 0 || status != QProcess::NormalExit || !m_workerReady) {
+        failPresentation(QStringLiteral("Wallpaper renderer exited (%1): %2")
+            .arg(code).arg(QString::fromUtf8(errors).trimmed()));
+    }
 }
 
 void SkwdVideoItem::closeDmabuf()
@@ -502,6 +653,12 @@ void SkwdVideoItem::closeDmabuf()
     if (m_socket >= 0) {
         ::close(m_socket);
         m_socket = -1;
+    }
+    delete m_frameNotifier;
+    m_frameNotifier = nullptr;
+    if (m_frameSocket >= 0) {
+        ::close(m_frameSocket);
+        m_frameSocket = -1;
     }
     QMutexLocker lock(&m_frameMutex);
     for (auto &slot : m_slots) {
@@ -527,51 +684,37 @@ void SkwdVideoItem::restart()
             return;
         }
     }
-    m_epoch = 0;
-    ++m_streamGeneration;
     m_stopping = true;
     if (m_process.state() != QProcess::NotRunning) {
         m_process.kill();
         m_process.waitForFinished(500);
     }
-    closeDmabuf();
     m_stopping = false;
-    m_buffer.clear();
-    m_stderr.clear();
-    m_error.clear();
-    m_workerReady = false;
-    m_frameAccepted = false;
-    m_headerWidth = 0;
-    m_headerHeight = 0;
-    {
-        QMutexLocker lock(&m_frameMutex);
-        m_frame.clear();
-        m_frameWidth = 0;
-        m_frameHeight = 0;
+    const bool pooled = poolEligible();
+    if (m_pooled && !pooled) {
+        m_pooled = false;
+        SkwdWorkerPool::instance()->detach(this);
     }
-    m_frameBytes = 0;
-    m_ready = false;
+    if (pooled) {
+        m_pooled = true;
+        SkwdWorkerPool::instance()->update(this);
+        return;
+    }
+    resetStream();
     if (m_assignment.isEmpty() || m_paper.isEmpty()) {
         update();
         return;
     }
-    int sockets[2];
-    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
-        failPresentation(QStringLiteral("Cannot create the wallpaper frame socket"));
+    const int childSocket = openStream();
+    if (childSocket < 0) {
         return;
     }
-    m_socket = sockets[0];
-    const int flags = ::fcntl(m_socket, F_GETFL, 0);
-    ::fcntl(m_socket, F_SETFL, flags | O_NONBLOCK);
-    const int childSocket = sockets[1];
     m_process.setChildProcessModifier([childSocket] {
         ::dup2(childSocket, 3);
         if (childSocket != 3) {
             ::close(childSocket);
         }
     });
-    m_socketNotifier = new QSocketNotifier(m_socket, QSocketNotifier::Read, this);
-    connect(m_socketNotifier, &QSocketNotifier::activated, this, &SkwdVideoItem::consumeDmabuf);
     QStringList arguments {QStringLiteral("present-plasma"),
             QStringLiteral("--assignment"), m_assignment,
             QStringLiteral("--stream-size"),
@@ -593,6 +736,43 @@ void SkwdVideoItem::restart()
     m_process.setProcessEnvironment(environment);
     m_process.start(m_paper, arguments);
     ::close(childSocket);
+}
+
+void SkwdVideoItem::resetStream()
+{
+    m_epoch = 0;
+    ++m_streamGeneration;
+    closeDmabuf();
+    m_buffer.clear();
+    m_stderr.clear();
+    m_error.clear();
+    m_workerReady = false;
+    m_frameAccepted = false;
+    m_headerWidth = 0;
+    m_headerHeight = 0;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        m_frame.clear();
+        m_frameWidth = 0;
+        m_frameHeight = 0;
+    }
+    m_frameBytes = 0;
+    m_ready = false;
+}
+
+int SkwdVideoItem::openStream()
+{
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
+        failPresentation(QStringLiteral("Cannot create the wallpaper frame socket"));
+        return -1;
+    }
+    m_socket = sockets[0];
+    const int flags = ::fcntl(m_socket, F_GETFL, 0);
+    ::fcntl(m_socket, F_SETFL, flags | O_NONBLOCK);
+    m_socketNotifier = new QSocketNotifier(m_socket, QSocketNotifier::Read, this);
+    connect(m_socketNotifier, &QSocketNotifier::activated, this, &SkwdVideoItem::consumeDmabuf);
+    return sockets[1];
 }
 
 void SkwdVideoItem::consumeDmabuf()
@@ -694,7 +874,12 @@ void SkwdVideoItem::acknowledge(int slot)
 
 void SkwdVideoItem::consume()
 {
-    m_buffer.append(m_process.readAllStandardOutput());
+    consumeFrames(m_process.readAllStandardOutput());
+}
+
+void SkwdVideoItem::consumeFrames(const QByteArray &bytes)
+{
+    m_buffer.append(bytes);
     if (!m_ready) {
         if (m_buffer.size() < 12) {
             return;

@@ -8,6 +8,7 @@
 #include <vector>
 
 class QSocketNotifier;
+class SkwdWorkerPool;
 
 class SkwdVideoItem : public QQuickItem {
     Q_OBJECT
@@ -18,6 +19,7 @@ class SkwdVideoItem : public QQuickItem {
     Q_PROPERTY(int streamHeight READ streamHeight WRITE setStreamHeight NOTIFY streamSizeChanged)
     Q_PROPERTY(int streamFps READ streamFps WRITE setStreamFps NOTIFY streamFpsChanged)
     Q_PROPERTY(bool paused READ paused WRITE setPaused NOTIFY pausedChanged)
+    Q_PROPERTY(QString output READ output WRITE setOutput NOTIFY outputChanged)
 
 public:
     explicit SkwdVideoItem(QQuickItem *parent = nullptr);
@@ -37,6 +39,27 @@ public:
     void setStreamFps(int value);
     bool paused() const;
     void setPaused(bool value);
+    QString output() const;
+    void setOutput(const QString &value);
+
+    struct StreamSpec {
+        int width = 0;
+        int height = 0;
+        int fps = 30;
+        QString output;
+        bool paused = false;
+        bool cpuFrames = false;
+    };
+    QByteArray workerKey() const;
+    StreamSpec streamSpec() const;
+    QByteArray sharedImageDevice() const;
+    QByteArray sharedImageDriver() const;
+    bool sharesWorker() const;
+    bool workerReady() const;
+    int beginSharedStream();
+    int beginSharedFrames();
+    void sharedWorkerFailed(const QString &error);
+    void sharedWorkerFinished(int code, QProcess::ExitStatus status, const QByteArray &errors);
 
 signals:
     void presentationIdChanged();
@@ -45,10 +68,12 @@ signals:
     void streamSizeChanged();
     void streamFpsChanged();
     void pausedChanged();
+    void outputChanged();
 
 protected:
     void componentComplete() override;
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) override;
+    void setSharedImageDevice(const QByteArray &uuid, const QByteArray &driver);
 
 public:
     struct DmabufSlot {
@@ -62,12 +87,18 @@ public:
         bool opaque = false;
     };
 
-private:
     void scheduleRestart();
+
+private:
     void restart();
+    void resetStream();
+    int openStream();
+    bool poolEligible() const;
     void sendControl(const QByteArray &line);
     void sendPause();
     void consume();
+    void consumeFrames(const QByteArray &bytes);
+    void readFrames();
     void consumeDmabuf();
     void closeDmabuf();
     void acknowledge(int slot);
@@ -90,6 +121,8 @@ private:
     int m_streamHeight = 720;
     int m_streamFps = 30;
     bool m_paused = false;
+    QString m_output;
+    bool m_pooled = false;
     bool m_restartScheduled = false;
     bool m_restartRequired = false;
     bool m_stopping = false;
@@ -105,6 +138,8 @@ private:
     std::array<DmabufSlot, 3> m_slots;
     QSocketNotifier *m_socketNotifier = nullptr;
     int m_socket = -1;
+    QSocketNotifier *m_frameNotifier = nullptr;
+    int m_frameSocket = -1;
     std::vector<int> m_pendingSlots;
     qsizetype m_frameBytes = 0;
     quint64 m_generation = 0;

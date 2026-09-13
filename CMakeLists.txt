@@ -14,6 +14,8 @@ add_library(skwdwallpaperplugin MODULE
     src/plugin.cpp
     src/skwdvideoitem.cpp
     src/skwdvideoitem.h
+    src/skwdworkerpool.cpp
+    src/skwdworkerpool.h
     src/skwdwindowmonitor.cpp
     src/skwdwindowmonitor.h
 )
@@ -34,12 +36,12 @@ if(BUILD_TESTING)
     target_link_libraries(window-state-test PRIVATE Qt6::Core Qt6::Network)
     add_test(NAME window-state COMMAND window-state-test)
     set_tests_properties(window-state PROPERTIES TIMEOUT 20)
-    add_executable(presentation-test scripts/tests/presentation.cpp src/skwdvideoitem.cpp src/skwdvideoitem.h)
+    add_executable(presentation-test scripts/tests/presentation.cpp src/skwdvideoitem.cpp src/skwdvideoitem.h src/skwdworkerpool.cpp src/skwdworkerpool.h)
     target_include_directories(presentation-test PRIVATE src)
     target_link_libraries(presentation-test PRIVATE Qt6::Core Qt6::Gui Qt6::OpenGL Qt6::Qml Qt6::Quick EGL PkgConfig::LIBDRM)
     add_test(NAME presentation COMMAND presentation-test)
     set_tests_properties(presentation PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 25)
-    add_executable(gpu-presentation-test scripts/tests/gpu-presentation.cpp src/skwdvideoitem.cpp src/skwdvideoitem.h)
+    add_executable(gpu-presentation-test scripts/tests/gpu-presentation.cpp src/skwdvideoitem.cpp src/skwdvideoitem.h src/skwdworkerpool.cpp src/skwdworkerpool.h)
     target_include_directories(gpu-presentation-test PRIVATE src)
     target_link_libraries(gpu-presentation-test PRIVATE Qt6::Core Qt6::Gui Qt6::OpenGL Qt6::Qml Qt6::Quick EGL PkgConfig::LIBDRM)
 endif()

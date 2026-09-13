@@ -11,6 +11,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <iostream>
+#include <memory>
+#include <vector>
 
 class Item : public SkwdVideoItem {
 public:
@@ -36,19 +38,30 @@ int main(int argc, char **argv)
     QDir().mkpath(artifacts);
     const QString runtime = qEnvironmentVariable("XDG_RUNTIME_DIR") + "/skwd-paper-plasma";
     QDir().mkpath(runtime);
+    // SKWD_TEST_SHARED_OUTPUTS=N stacks N items with distinct output names so one
+    // presenter process must serve every item.
+    const int outputs = qMax(1, qEnvironmentVariableIntValue("SKWD_TEST_SHARED_OUTPUTS"));
     QQuickWindow window;
     window.setTitle(QStringLiteral("SKWD GPU presentation test"));
-    window.setMinimumSize(QSize(960, 540));
-    window.setMaximumSize(QSize(960, 540));
-    window.resize(960, 540);
-    Item item(window.contentItem());
-    item.setSize(QSizeF(960, 540));
-    QObject::connect(&window, &QQuickWindow::widthChanged, &item, [&] { item.setWidth(window.width()); });
-    QObject::connect(&window, &QQuickWindow::heightChanged, &item, [&] { item.setHeight(window.height()); });
-    item.setStreamWidth(1920);
-    item.setStreamHeight(1080);
-    item.setPaper(QString::fromLocal8Bit(argv[1]));
-    item.componentComplete();
+    const QSize size(960, 540 * outputs);
+    window.setMinimumSize(size);
+    window.setMaximumSize(size);
+    window.resize(size);
+    std::vector<std::unique_ptr<Item>> items;
+    for (int index = 0; index < outputs; ++index) {
+        auto item = std::make_unique<Item>(window.contentItem());
+        item->setPosition(QPointF(0, 540 * index));
+        item->setSize(QSizeF(960, 540));
+        item->setStreamWidth(1920);
+        item->setStreamHeight(1080);
+        item->setPaper(QString::fromLocal8Bit(argv[1]));
+        if (outputs > 1) {
+            item->setOutput(QStringLiteral("TEST-%1").arg(index + 1));
+        }
+        item->componentComplete();
+        items.push_back(std::move(item));
+    }
+    Item &item = *items.front();
     window.show();
     window.requestActivate();
     int request = 0;
@@ -58,8 +71,12 @@ int main(int argc, char **argv)
         if (!statusFile.open(QIODevice::WriteOnly)) return 66;
         statusFile.write("{\"state\":\"pending\"}");
         statusFile.close();
+        const QString encoded = QString::fromUtf8(QJsonDocument(assignment.toObject()).toJson(QJsonDocument::Compact));
+        for (auto &other : items) {
+            if (other.get() != &item) other->setAssignment(encoded);
+        }
         item.setPresentationId(id);
-        item.setAssignment(QString::fromUtf8(QJsonDocument(assignment.toObject()).toJson(QJsonDocument::Compact)));
+        item.setAssignment(encoded);
         QElapsedTimer timer;
         timer.start();
         QJsonObject status;
@@ -79,6 +96,15 @@ int main(int argc, char **argv)
         std::cout << "presentation " << request << " after " << timer.elapsed() << " ms: "
                   << QJsonDocument(status).toJson(QJsonDocument::Compact).toStdString() << std::endl;
         if (status["state"] != "ready") return 1;
+        if (outputs > 1) {
+            QEventLoop settle;
+            QTimer::singleShot(1500, &settle, &QEventLoop::quit);
+            settle.exec();
+            int ready = 0;
+            for (auto &other : items) ready += other->workerReady() && other->sharesWorker();
+            std::cout << "shared outputs ready " << ready << "/" << outputs << std::endl;
+            if (ready != outputs) return 3;
+        }
         for (int capture = 0; capture < 2; ++capture) {
             QEventLoop frameLoop;
             QTimer::singleShot(750, &frameLoop, &QEventLoop::quit);
