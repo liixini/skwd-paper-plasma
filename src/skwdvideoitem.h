@@ -90,6 +90,7 @@ public:
     void scheduleRestart();
 
 private:
+    void createProcess();
     void restart();
     void resetStream();
     int openStream();
@@ -106,6 +107,7 @@ private:
     void failPresentation(const QString &error);
     void reportPresentation();
     void frameAccepted();
+    void scheduleFramePoll();
     void frameFailed(const QString &error);
 
     QString m_presentationId;
@@ -127,7 +129,7 @@ private:
     bool m_restartRequired = false;
     bool m_stopping = false;
     bool m_destroying = false;
-    QProcess m_process;
+    QProcess *m_process = nullptr;
     QByteArray m_buffer;
     QByteArray m_frame;
     int m_headerWidth = 0;
@@ -136,6 +138,8 @@ private:
     int m_frameHeight = 0;
     QMutex m_frameMutex;
     std::array<DmabufSlot, 3> m_slots;
+    std::array<bool, 3> m_outstandingSlots {};
+    std::array<bool, 3> m_ackSlots {};
     QSocketNotifier *m_socketNotifier = nullptr;
     int m_socket = -1;
     QSocketNotifier *m_frameNotifier = nullptr;
@@ -149,4 +153,5 @@ private:
     QByteArray m_deviceUuid;
     QByteArray m_driverUuid;
     bool m_ready = false;
+    bool m_framePollScheduled = false;
 };

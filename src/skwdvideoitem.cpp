@@ -1,7 +1,10 @@
 #include "skwdvideoitem.h"
 #include "skwdworkerpool.h"
+#include "skwdprocess.h"
 
 #include <QImage>
+#include <QElapsedTimer>
+#include <QOpenGLExtraFunctions>
 #include <QProcessEnvironment>
 #include <QSGRendererInterface>
 #include <QDir>
@@ -32,9 +35,15 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
 
 namespace {
 constexpr int SlotCount = 3;
+
+struct ReceivedDescriptor {
+    int fd = -1;
+    ~ReceivedDescriptor() { if (fd >= 0) ::close(fd); }
+};
 
 quint32 read32(const uchar *data)
 {
@@ -54,12 +63,17 @@ public:
         GLuint memory = 0;
         GLuint semaphore = 0;
         QSGTexture *texture = nullptr;
+        GLsync retired = nullptr;
+        QElapsedTimer retirementAge;
     };
 
     ~SkwdFrameNode() override
     {
         const bool hasContext = QOpenGLContext::currentContext() != nullptr;
         for (auto &slot : textures) {
+            if (hasContext && slot.retired) {
+                QOpenGLContext::currentContext()->extraFunctions()->glDeleteSync(slot.retired);
+            }
             delete slot.texture;
             if (hasContext && slot.name != 0) {
                 glDeleteTextures(1, &slot.name);
@@ -199,6 +213,26 @@ public:
         return glGetError() == GL_NO_ERROR;
     }
 
+    bool retire(int index)
+    {
+        auto &slot = textures[index];
+        slot.retired = QOpenGLContext::currentContext()->extraFunctions()->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        slot.retirementAge.start();
+        return slot.retired != nullptr;
+    }
+
+    GLenum retirementStatus(int index)
+    {
+        auto &slot = textures[index];
+        auto *gl = QOpenGLContext::currentContext()->extraFunctions();
+        const GLenum status = gl->glClientWaitSync(slot.retired, 0, 0);
+        if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) {
+            gl->glDeleteSync(slot.retired);
+            slot.retired = nullptr;
+        }
+        return status;
+    }
+
     std::array<Texture, SlotCount> textures;
     EGLDisplay display = EGL_NO_DISPLAY;
     PFNEGLCREATEIMAGEKHRPROC createImage = nullptr;
@@ -223,15 +257,21 @@ SkwdVideoItem::SkwdVideoItem(QQuickItem *parent)
     : QQuickItem(parent)
 {
     setFlag(ItemHasContents, true);
-    m_process.setProcessChannelMode(QProcess::SeparateChannels);
-    connect(&m_process, &QProcess::readyReadStandardOutput, this, &SkwdVideoItem::consume);
-    connect(&m_process, &QProcess::readyReadStandardError, this, &SkwdVideoItem::collectErrors);
-    connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+    createProcess();
+}
+
+void SkwdVideoItem::createProcess()
+{
+    m_process = new QProcess(this);
+    m_process->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(m_process, &QProcess::readyReadStandardOutput, this, &SkwdVideoItem::consume);
+    connect(m_process, &QProcess::readyReadStandardError, this, &SkwdVideoItem::collectErrors);
+    connect(m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart) {
-            failPresentation(QStringLiteral("Cannot start %1: %2").arg(m_paper, m_process.errorString()));
+            failPresentation(QStringLiteral("Cannot start %1: %2").arg(m_paper, m_process->errorString()));
         }
     });
-    connect(&m_process, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+    connect(m_process, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
         if (m_stopping || m_destroying || m_assignment.isEmpty()) {
             return;
         }
@@ -252,11 +292,7 @@ SkwdVideoItem::~SkwdVideoItem()
         SkwdWorkerPool::instance()->detach(this);
     }
     closeDmabuf();
-    m_process.terminate();
-    if (!m_process.waitForFinished(500)) {
-        m_process.kill();
-        m_process.waitForFinished(500);
-    }
+    retireSkwdProcess(m_process);
 }
 
 QString SkwdVideoItem::presentationId() const
@@ -283,7 +319,7 @@ void SkwdVideoItem::setPresentationId(const QString &value)
 
 void SkwdVideoItem::collectErrors()
 {
-    m_stderr.append(m_process.readAllStandardError());
+    m_stderr.append(m_process->readAllStandardError());
     m_stderr = m_stderr.right(8192);
 }
 
@@ -297,8 +333,8 @@ void SkwdVideoItem::failPresentation(const QString &error)
     const auto detail = error.lastIndexOf(marker);
     m_error = (detail >= 0 ? error.mid(detail + marker.size()) : error).left(2048).trimmed();
     reportPresentation();
-    if (m_process.state() != QProcess::NotRunning) {
-        m_process.kill();
+    if (m_process->state() != QProcess::NotRunning) {
+        m_process->kill();
     }
 }
 
@@ -487,7 +523,7 @@ void SkwdVideoItem::scheduleRestart()
 
 void SkwdVideoItem::sendControl(const QByteArray &line)
 {
-    if (m_process.state() == QProcess::Running && m_process.write(line) < 0) {
+    if (m_process->state() == QProcess::Running && m_process->write(line) < 0) {
         scheduleRestart();
     }
 }
@@ -588,7 +624,7 @@ void SkwdVideoItem::readFrames()
 {
     QByteArray bytes;
     std::array<char, 65536> chunk {};
-    for (;;) {
+    while (bytes.size() < 1024 * 1024) {
         const ssize_t length = ::read(m_frameSocket, chunk.data(), chunk.size());
         if (length > 0) {
             bytes.append(chunk.data(), length);
@@ -671,6 +707,8 @@ void SkwdVideoItem::closeDmabuf()
         slot = {};
     }
     m_pendingSlots.clear();
+    m_outstandingSlots.fill(false);
+    m_ackSlots.fill(false);
 }
 
 void SkwdVideoItem::restart()
@@ -685,10 +723,8 @@ void SkwdVideoItem::restart()
         }
     }
     m_stopping = true;
-    if (m_process.state() != QProcess::NotRunning) {
-        m_process.kill();
-        m_process.waitForFinished(500);
-    }
+    retireSkwdProcess(m_process);
+    createProcess();
     m_stopping = false;
     const bool pooled = poolEligible();
     if (m_pooled && !pooled) {
@@ -709,11 +745,12 @@ void SkwdVideoItem::restart()
     if (childSocket < 0) {
         return;
     }
-    m_process.setChildProcessModifier([childSocket] {
-        ::dup2(childSocket, 3);
+    m_process->setChildProcessModifier([childSocket] {
+        if (::dup2(childSocket, 3) < 0 || ::fcntl(3, F_SETFD, 0) < 0) ::_exit(127);
         if (childSocket != 3) {
             ::close(childSocket);
         }
+        if (!isolateSkwdProcessDescriptors(4)) ::_exit(127);
     });
     QStringList arguments {QStringLiteral("present-plasma"),
             QStringLiteral("--assignment"), m_assignment,
@@ -733,8 +770,8 @@ void SkwdVideoItem::restart()
         environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DEVICE_UUID"));
         environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DRIVER_UUID"));
     }
-    m_process.setProcessEnvironment(environment);
-    m_process.start(m_paper, arguments);
+    m_process->setProcessEnvironment(environment);
+    m_process->start(m_paper, arguments);
     ::close(childSocket);
 }
 
@@ -777,7 +814,7 @@ int SkwdVideoItem::openStream()
 
 void SkwdVideoItem::consumeDmabuf()
 {
-    for (;;) {
+    for (int batch = 0; batch < 32; ++batch) {
         std::array<uchar, 32> bytes {};
         std::array<uchar, CMSG_SPACE(sizeof(int))> control {};
         iovec iov {bytes.data(), bytes.size()};
@@ -786,14 +823,27 @@ void SkwdVideoItem::consumeDmabuf()
         message.msg_iovlen = 1;
         message.msg_control = control.data();
         message.msg_controllen = control.size();
-        const ssize_t length = ::recvmsg(m_socket, &message, MSG_DONTWAIT);
+        const ssize_t length = ::recvmsg(m_socket, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
         if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return;
+        }
+        ReceivedDescriptor received;
+        int descriptorCount = 0;
+        for (cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+            if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) continue;
+            const size_t count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t index = 0; index < count; ++index) {
+                int fd;
+                std::memcpy(&fd, CMSG_DATA(header) + index * sizeof(int), sizeof(fd));
+                if (++descriptorCount == 1) received.fd = fd;
+                else ::close(fd);
+            }
         }
         if (length <= 0) {
             m_socketNotifier->setEnabled(false);
             return;
         }
+        if (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC) || descriptorCount > 1) continue;
         if (length != 32 || std::memcmp(bytes.data(), "SKDG", 4) != 0) {
             continue;
         }
@@ -806,6 +856,8 @@ void SkwdVideoItem::consumeDmabuf()
                 slot = {};
             }
             m_pendingSlots.clear();
+            m_outstandingSlots.fill(false);
+            m_ackSlots.fill(false);
             m_frame.clear();
             m_buffer.clear();
             m_ready = false;
@@ -828,20 +880,16 @@ void SkwdVideoItem::consumeDmabuf()
             continue;
         }
         if ((bytes[4] == 1 || bytes[4] == 4 || bytes[4] == 5) && length == 32) {
-            int receivedFd = -1;
-            for (cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
-                if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS) {
-                    std::memcpy(&receivedFd, CMSG_DATA(header), sizeof(receivedFd));
-                    break;
-                }
-            }
+            if (received.fd < 0) continue;
             QMutexLocker lock(&m_frameMutex);
             auto &slot = m_slots[slotIndex];
             if (bytes[4] == 5) {
-                slot.semaphoreFd = receivedFd;
+                if (slot.semaphoreFd >= 0) ::close(slot.semaphoreFd);
+                slot.semaphoreFd = std::exchange(received.fd, -1);
                 continue;
             }
-            slot.fd = receivedFd;
+            if (slot.fd >= 0) ::close(slot.fd);
+            slot.fd = std::exchange(received.fd, -1);
             slot.width = read32(bytes.data() + 8);
             slot.height = read32(bytes.data() + 12);
             slot.stride = read32(bytes.data() + 16);
@@ -849,6 +897,12 @@ void SkwdVideoItem::consumeDmabuf()
             slot.modifier = read64(bytes.data() + 24);
             slot.opaque = bytes[4] == 4;
         } else if (bytes[4] == 2) {
+            if (m_outstandingSlots[slotIndex]) {
+                failPresentation(QStringLiteral("Wallpaper renderer reused a GPU frame before release"));
+                m_socketNotifier->setEnabled(false);
+                return;
+            }
+            m_outstandingSlots[slotIndex] = true;
             {
                 QMutexLocker lock(&m_frameMutex);
                 m_pendingSlots.push_back(slotIndex);
@@ -869,12 +923,16 @@ void SkwdVideoItem::acknowledge(int slot)
     bytes[4] = 3;
     bytes[5] = uchar(slot);
     qToLittleEndian(m_epoch, bytes.data() + 6);
-    ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+    const ssize_t sent = ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+    m_ackSlots[slot] = sent != ssize_t(bytes.size());
+    if (m_ackSlots[slot]) scheduleFramePoll();
+    else m_outstandingSlots[slot] = false;
 }
 
 void SkwdVideoItem::consume()
 {
-    consumeFrames(m_process.readAllStandardOutput());
+    consumeFrames(m_process->read(1024 * 1024));
+    if (m_process->bytesAvailable() > 0) QTimer::singleShot(0, this, &SkwdVideoItem::consume);
 }
 
 void SkwdVideoItem::consumeFrames(const QByteArray &bytes)
@@ -915,6 +973,19 @@ void SkwdVideoItem::consumeFrames(const QByteArray &bytes)
     }
 }
 
+void SkwdVideoItem::scheduleFramePoll()
+{
+    const auto generation = m_streamGeneration;
+    QMetaObject::invokeMethod(this, [this, generation] {
+        if (generation != m_streamGeneration || m_framePollScheduled || !m_error.isEmpty()) return;
+        m_framePollScheduled = true;
+        QTimer::singleShot(16, this, [this, generation] {
+            m_framePollScheduled = false;
+            if (generation == m_streamGeneration && m_error.isEmpty()) update();
+        });
+    }, Qt::QueuedConnection);
+}
+
 QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
     if (!m_deviceKnown) {
@@ -947,6 +1018,9 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             scheduleRestart();
         }, Qt::QueuedConnection);
     }
+    for (int slot = 0; slot < SlotCount; ++slot) {
+        if (m_ackSlots[slot]) acknowledge(slot);
+    }
     auto *node = static_cast<SkwdFrameNode *>(oldNode);
     std::vector<int> pendingSlots;
     quint64 generation;
@@ -972,11 +1046,23 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         node->setFiltering(QSGTexture::Linear);
     }
     node->setRect(boundingRect());
+    bool retiring = false;
+    if (node->streamGeneration == m_streamGeneration) {
+        for (int slot = 0; slot < SlotCount; ++slot) {
+            if (!node->textures[slot].retired) continue;
+            const GLenum status = node->retirementStatus(slot);
+            if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) {
+                acknowledge(slot);
+            } else if (status == GL_WAIT_FAILED || node->textures[slot].retirementAge.elapsed() >= 2000) {
+                frameFailed(QStringLiteral("Wallpaper GPU frame release did not complete"));
+                return node;
+            } else {
+                retiring = true;
+            }
+        }
+    }
+    if (retiring) scheduleFramePoll();
     if (pending >= 0) {
-        // A dropped frame still owns a signaled binary semaphore. Consume every
-        // signal on the render thread before allowing the producer to reuse its
-        // slot; acknowledging a skipped frame from the GUI thread can otherwise
-        // cause Vulkan to signal the same semaphore twice and stall the queue.
         for (int slot : pendingSlots) {
             bool imported;
             {
@@ -992,16 +1078,25 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
                 return node;
             }
         }
-        if (node->currentSlot >= 0 || pendingSlots.size() > 1) {
-            glFinish();
-            if (node->currentSlot >= 0 && node->currentSlot != pending) {
-                acknowledge(node->currentSlot);
+        if (node->currentSlot >= 0 && node->currentSlot != pending) {
+            if (!node->retire(node->currentSlot)) {
+                frameFailed(QStringLiteral("Cannot track wallpaper GPU frame release"));
+                return node;
             }
-            for (int slot : pendingSlots) {
-                if (slot != pending) {
-                    acknowledge(slot);
+            retiring = true;
+        }
+        for (int slot : pendingSlots) {
+            if (slot != pending) {
+                if (!node->retire(slot)) {
+                    frameFailed(QStringLiteral("Cannot track wallpaper GPU frame release"));
+                    return node;
                 }
+                retiring = true;
             }
+        }
+        if (retiring) {
+            glFlush();
+            scheduleFramePoll();
         }
         node->setTexture(node->textures[pending].texture);
         node->setOwnsTexture(false);

@@ -9,6 +9,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <iostream>
+#include <signal.h>
+#include <cerrno>
 
 class Item : public SkwdVideoItem {
 public:
@@ -29,7 +31,7 @@ int main(int argc, char **argv)
     QFile helper(runtime.path() + "/presenter");
     if (!helper.open(QIODevice::WriteOnly)) return 1;
     helper.write(R"PY(#!/usr/bin/python3
-import os, socket, struct, sys
+import os, socket, struct, sys, signal, array
 mode = sys.argv[sys.argv.index('--assignment') + 1]
 if mode.startswith('{'):
     runtime = os.environ['XDG_RUNTIME_DIR']
@@ -59,6 +61,26 @@ if mode.startswith('{'):
         with open(runtime + '/shared.log', 'a') as log:
             log.write('control ' + line)
     sys.exit(0)
+if mode == 'stubborn':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(os.environ['XDG_RUNTIME_DIR'] + '/stubborn.pid', 'w') as pid:
+        pid.write(str(os.getpid()))
+if mode == 'fdspam':
+    stream = socket.socket(fileno=3)
+    fd = os.open('/dev/null', os.O_RDONLY)
+    for _ in range(100):
+        for data, fds in [(b'bad', [fd]), (b'SKDG' + bytes([4, 9]) + bytes(26), [fd]),
+                          (b'SKDG' + bytes([4, 0, 1]) + bytes(25), [fd]),
+                          (b'SKDG' + bytes([4, 0]) + bytes(26), [fd, fd, fd])]:
+            stream.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
+    os.close(fd)
+    stream.send(b'SKDG' + bytes([6]) + bytes(27))
+if mode == 'duplicate':
+    stream = socket.socket(fileno=3)
+    for _ in range(2):
+        stream.send(b'SKDG' + bytes([2, 0]) + bytes(26))
+    sys.stdin.read()
+    sys.exit(0)
 if mode == 'burst':
     stream = socket.socket(fileno=3)
     for slot in range(3):
@@ -81,7 +103,7 @@ if mode in ('epochs', 'stale'):
 if mode == 'fail':
     sys.stderr.write('synthetic export unavailable\n')
     sys.exit(2)
-if mode == 'ready':
+if mode in ('ready', 'stubborn'):
     socket.socket(fileno=3).send(b'SKDG' + bytes([6]) + bytes(27))
 sys.stdout.buffer.write(b'SKWP' + struct.pack('<II',16,16) + bytes([255,0,0,255])*256)
 sys.stdout.buffer.flush()
@@ -126,10 +148,18 @@ sys.stdin.read()
   
     item.setVisible(false);
     if (!check("burst", "error", "held until rendering")) return 7;
+    if (!check("duplicate", "error", "reused a GPU frame before release")) return 29;
     item.setVisible(true);
     window.show();
     if (!check("ready", "ready")) return 2;
     if (!check("ready", "ready")) return 3;
+    const int descriptors = QDir("/proc/self/fd").entryList(QDir::AllEntries | QDir::NoDotAndDotDot).size();
+    if (!check("fdspam", "ready")) return 30;
+    const int afterSpam = QDir("/proc/self/fd").entryList(QDir::AllEntries | QDir::NoDotAndDotDot).size();
+    if (afterSpam > descriptors + 4) {
+        std::cerr << "rejected packets leaked descriptors: " << descriptors << " -> " << afterSpam << std::endl;
+        return 31;
+    }
     if (!check("epochs", "ready")) return 8;
     if (!check("stale", "error", "Wallpaper renderer exited")) return 9;
     if (!check("fail", "error", "synthetic export unavailable")) return 4;
@@ -270,5 +300,21 @@ sys.stdin.read()
         std::cerr << "unexpected legacy sequence: " << sharedLog().toStdString();
         return 27;
     }
+    auto *stubborn = new Item(window.contentItem());
+    stubborn->setSize(QSizeF(32, 32));
+    stubborn->setPaper(helper.fileName());
+    stubborn->setAssignment("stubborn");
+    stubborn->componentComplete();
+    if (!settled([&] { return stubborn->workerReady(); })) return 32;
+    QFile pidFile(runtime.path() + "/stubborn.pid");
+    if (!pidFile.open(QIODevice::ReadOnly)) return 33;
+    const int pid = pidFile.readAll().trimmed().toInt();
+    QElapsedTimer removal;
+    removal.start();
+    delete stubborn;
+    const auto removalMs = removal.elapsed();
+    std::cout << "unresponsive renderer removal: " << removalMs << " ms" << std::endl;
+    if (removalMs >= 100) return 34;
+    if (!settled([&] { return ::kill(pid, 0) == -1 && errno == ESRCH; })) return 35;
     return 0;
 }

@@ -10,7 +10,7 @@ class PlasmaContractTests(unittest.TestCase):
         source = (ROOT / "src/skwdvideoitem.cpp").read_text()
         qml = (ROOT / "wallpaper/contents/ui/main.qml").read_text()
         self.assertIn("present-plasma", source)
-        self.assertIn("m_process.start(m_paper, arguments)", source)
+        self.assertIn("m_process->start(m_paper, arguments)", source)
         self.assertIn("JSON.stringify(root.currentAssignment.assignment)", qml)
         for forbidden in (
             "skwd-wall-vk",

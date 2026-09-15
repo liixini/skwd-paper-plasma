@@ -33,6 +33,7 @@ private:
 
     explicit SkwdWorkerPool(QObject *parent = nullptr);
     Worker *workerFor(const QByteArray &key);
+    void createProcess(Worker *worker);
     void scheduleSpawn(Worker *worker);
     void spawn(Worker *worker);
     void stop(Worker *worker);

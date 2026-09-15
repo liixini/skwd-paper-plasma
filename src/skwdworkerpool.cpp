@@ -1,5 +1,6 @@
 #include "skwdworkerpool.h"
 #include "skwdvideoitem.h"
+#include "skwdprocess.h"
 
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -38,31 +39,36 @@ SkwdWorkerPool::Worker *SkwdWorkerPool::workerFor(const QByteArray &key)
     if (!worker) {
         worker = new Worker;
         worker->key = key;
-        worker->process = new QProcess(this);
-        worker->process->setProcessChannelMode(QProcess::SeparateChannels);
-        connect(worker->process, &QProcess::readyReadStandardOutput, this, [worker] {
-            worker->process->readAllStandardOutput();
-        });
-        connect(worker->process, &QProcess::readyReadStandardError, this, [worker] {
-            worker->errors.append(worker->process->readAllStandardError());
-            worker->errors = worker->errors.right(8192);
-        });
-        connect(worker->process, &QProcess::errorOccurred, this, [this, worker](QProcess::ProcessError error) {
-            if (error != QProcess::FailedToStart || worker->stopping) {
-                return;
-            }
-            const auto members = worker->members;
-            for (auto *member : members) {
-                member->sharedWorkerFailed(QStringLiteral("Cannot start %1: %2")
-                    .arg(worker->process->program(), worker->process->errorString()));
-            }
-        });
-        connect(worker->process, &QProcess::finished, this, [this, worker](int code, QProcess::ExitStatus status) {
-            finished(worker, code, status);
-        });
+        createProcess(worker);
         m_workers.insert(key, worker);
     }
     return worker;
+}
+
+void SkwdWorkerPool::createProcess(Worker *worker)
+{
+    worker->process = new QProcess(this);
+    worker->process->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(worker->process, &QProcess::readyReadStandardOutput, this, [worker] {
+        worker->process->readAllStandardOutput();
+    });
+    connect(worker->process, &QProcess::readyReadStandardError, this, [worker] {
+        worker->errors.append(worker->process->readAllStandardError());
+        worker->errors = worker->errors.right(8192);
+    });
+    connect(worker->process, &QProcess::errorOccurred, this, [this, worker](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart || worker->stopping) {
+            return;
+        }
+        const auto members = worker->members;
+        for (auto *member : members) {
+            member->sharedWorkerFailed(QStringLiteral("Cannot start %1: %2")
+                .arg(worker->process->program(), worker->process->errorString()));
+        }
+    });
+    connect(worker->process, &QProcess::finished, this, [this, worker](int code, QProcess::ExitStatus status) {
+        finished(worker, code, status);
+    });
 }
 
 void SkwdWorkerPool::update(SkwdVideoItem *item)
@@ -128,12 +134,8 @@ void SkwdWorkerPool::scheduleSpawn(Worker *worker)
 
 void SkwdWorkerPool::stop(Worker *worker)
 {
-    worker->stopping = true;
-    if (worker->process->state() != QProcess::NotRunning) {
-        worker->process->kill();
-        worker->process->waitForFinished(500);
-    }
-    worker->stopping = false;
+    retireSkwdProcess(worker->process);
+    worker->process = nullptr;
     worker->errors.clear();
 }
 
@@ -141,7 +143,6 @@ void SkwdWorkerPool::release(Worker *worker)
 {
     m_workers.remove(worker->key);
     stop(worker);
-    worker->process->deleteLater();
     delete worker;
 }
 
@@ -175,6 +176,7 @@ void SkwdWorkerPool::finished(Worker *worker, int code, QProcess::ExitStatus sta
 void SkwdWorkerPool::spawn(Worker *worker)
 {
     stop(worker);
+    createProcess(worker);
     if (worker->members.isEmpty()) {
         return;
     }
@@ -227,12 +229,14 @@ void SkwdWorkerPool::spawn(Worker *worker)
     worker->process->setChildProcessModifier([sockets, count] {
         std::array<int, MaxSharedStreams> parked {};
         for (int index = 0; index < count; ++index) {
-            parked[index] = ::fcntl(sockets[index], F_DUPFD, 3 + count);
+            parked[index] = ::fcntl(sockets[index], F_DUPFD_CLOEXEC, 3 + count);
+            if (parked[index] < 0) ::_exit(127);
         }
         for (int index = 0; index < count; ++index) {
-            ::dup2(parked[index], 3 + index);
+            if (::dup2(parked[index], 3 + index) < 0) ::_exit(127);
             ::close(parked[index]);
         }
+        if (!isolateSkwdProcessDescriptors(3 + count)) ::_exit(127);
     });
     auto environment = QProcessEnvironment::systemEnvironment();
     environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_GPU_STREAM"),
