@@ -21,6 +21,8 @@
 #include <QSGTexture>
 #include <QtGui/qopenglcontext_platform.h>
 #include <QtQuick/qsgtexture_platform.h>
+#include <QEvent>
+#include <QMouseEvent>
 #include <QSocketNotifier>
 #include <QTimer>
 #include <QtEndian>
@@ -503,6 +505,84 @@ void SkwdVideoItem::componentComplete()
 {
     QQuickItem::componentComplete();
     restart();
+}
+
+void SkwdVideoItem::itemChange(ItemChange change, const ItemChangeData &value)
+{
+    QQuickItem::itemChange(change, value);
+    if (change != ItemSceneChange) {
+        return;
+    }
+    if (m_pointerWindow) {
+        m_pointerWindow->removeEventFilter(this);
+    }
+    m_pointerWindow = value.window;
+    if (m_pointerWindow) {
+        m_pointerWindow->installEventFilter(this);
+        m_pointerTimer.start();
+    }
+}
+
+bool SkwdVideoItem::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched != m_pointerWindow) {
+        return false;
+    }
+    switch (event->type()) {
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease: {
+        const auto *mouse = static_cast<QMouseEvent *>(event);
+        sendPointer(mouse->scenePosition(), mouse->buttons(), event->type() != QEvent::MouseMove);
+        break;
+    }
+    default:
+        break;
+    }
+    return false;
+}
+
+static quint8 pointerButtonMask(Qt::MouseButtons buttons)
+{
+    quint8 mask = 0;
+    if (buttons & Qt::LeftButton) mask |= 1;
+    if (buttons & Qt::RightButton) mask |= 2;
+    if (buttons & Qt::MiddleButton) mask |= 4;
+    return mask;
+}
+
+void SkwdVideoItem::sendPointer(const QPointF &scenePosition, Qt::MouseButtons buttons, bool buttonsChanged)
+{
+    if (width() <= 0 || height() <= 0 || !m_process || m_process->state() != QProcess::Running) {
+        return;
+    }
+    const QPointF local = mapFromScene(scenePosition);
+    const quint16 x = quint16(qBound(0.0, local.x() / width(), 1.0) * 65535.0 + 0.5);
+    const quint16 y = quint16(qBound(0.0, local.y() / height(), 1.0) * 65535.0 + 0.5);
+    const quint32 packed = (quint32(x) << 16) | y;
+    const quint8 mask = pointerButtonMask(buttons);
+    if (!buttonsChanged && packed == m_pointerLast && mask == m_pointerButtons) {
+        return;
+    }
+    if (!buttonsChanged && m_pointerTimer.isValid() && m_pointerTimer.elapsed() < 16) {
+        return;
+    }
+    m_pointerTimer.restart();
+    m_pointerLast = packed;
+    m_pointerButtons = mask;
+    QJsonObject pointer;
+    pointer.insert(QStringLiteral("x"), int(x));
+    pointer.insert(QStringLiteral("y"), int(y));
+    pointer.insert(QStringLiteral("buttons"), int(mask));
+    QJsonObject command;
+    command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
+    command.insert(QStringLiteral("pointer"), pointer);
+    const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
+    if (m_pooled) {
+        SkwdWorkerPool::instance()->sendControl(this, line);
+        return;
+    }
+    sendControl(line);
 }
 
 void SkwdVideoItem::scheduleRestart()

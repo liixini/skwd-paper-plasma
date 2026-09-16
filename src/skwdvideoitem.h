@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QProcess>
 #include <QQuickItem>
@@ -72,6 +73,8 @@ signals:
 
 protected:
     void componentComplete() override;
+    void itemChange(ItemChange change, const ItemChangeData &value) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) override;
     void setSharedImageDevice(const QByteArray &uuid, const QByteArray &driver);
 
@@ -97,6 +100,7 @@ private:
     bool poolEligible() const;
     void sendControl(const QByteArray &line);
     void sendPause();
+    void sendPointer(const QPointF &scenePosition, Qt::MouseButtons buttons, bool buttonsChanged);
     void consume();
     void consumeFrames(const QByteArray &bytes);
     void readFrames();
@@ -154,4 +158,8 @@ private:
     QByteArray m_driverUuid;
     bool m_ready = false;
     bool m_framePollScheduled = false;
+    QQuickWindow *m_pointerWindow = nullptr;
+    QElapsedTimer m_pointerTimer;
+    quint32 m_pointerLast = 0;
+    quint8 m_pointerButtons = 0;
 };
