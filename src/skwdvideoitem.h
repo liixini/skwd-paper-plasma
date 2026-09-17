@@ -95,6 +95,7 @@ public:
 private:
     void createProcess();
     void restart();
+    bool retune(const QString &previous);
     void resetStream();
     int openStream();
     bool poolEligible() const;
@@ -112,6 +113,7 @@ private:
     void reportPresentation();
     void frameAccepted();
     void scheduleFramePoll();
+    bool slotsExhausted() const;
     void frameFailed(const QString &error);
 
     QString m_presentationId;
@@ -154,10 +156,13 @@ private:
     quint64 m_streamGeneration = 0;
     quint16 m_epoch = 0;
     bool m_deviceKnown = false;
+    bool m_stillStream = false;
+    bool m_gpuUnavailable = false;
     QByteArray m_deviceUuid;
     QByteArray m_driverUuid;
     bool m_ready = false;
     bool m_framePollScheduled = false;
+    bool m_lateAcks = false;
     QQuickWindow *m_pointerWindow = nullptr;
     QElapsedTimer m_pointerTimer;
     quint32 m_pointerLast = 0;

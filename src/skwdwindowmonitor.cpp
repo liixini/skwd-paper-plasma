@@ -1,26 +1,44 @@
 #include "skwdwindowmonitor.h"
 
-#include <QDir>
+#include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QStandardPaths>
-#include <QTimer>
+
+namespace {
+constexpr qint64 BriefConnectionMs = 1000;
+constexpr int RetryBaseMs = 250;
+constexpr int RetryLimit = 6;
+constexpr int GraceMs = 2000;
+constexpr qint64 LineLimit = 1024 * 1024;
+}
 
 SkwdWindowMonitor::SkwdWindowMonitor(QObject *parent)
     : QObject(parent)
     , m_runtime(QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation))
     , m_directory(m_runtime + QStringLiteral("/skwd-wall-v2"))
 {
-    connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, &SkwdWindowMonitor::reconnect);
-    connect(&m_socket, &QLocalSocket::connected, this, [this] { m_last.clear(); schedule(); });
-    connect(&m_socket, &QLocalSocket::disconnected, this, [this] {
-        m_hasPolicy = false;
-        emit policyChanged();
-        reconnect();
+    m_retry.setSingleShot(true);
+    connect(&m_retry, &QTimer::timeout, this, &SkwdWindowMonitor::reconnect);
+    m_grace.setSingleShot(true);
+    connect(&m_grace, &QTimer::timeout, this, &SkwdWindowMonitor::settle);
+    connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, [this] {
+        if (!m_retry.isActive()) m_retry.start(0);
+    });
+    connect(&m_socket, &QLocalSocket::connected, this, [this] {
+        m_connectedAt.start();
+        unwatch();
+        m_last.clear();
+        schedule();
+    });
+    connect(&m_socket, &QLocalSocket::disconnected, this, &SkwdWindowMonitor::lost);
+    connect(&m_socket, &QLocalSocket::errorOccurred, this, [this] {
+        if (m_socket.state() == QLocalSocket::UnconnectedState) watch();
     });
     connect(&m_socket, &QLocalSocket::bytesWritten, this, &SkwdWindowMonitor::schedule);
     connect(&m_socket, &QLocalSocket::readyRead, this, &SkwdWindowMonitor::receivePolicy);
-    m_socket.setReadBufferSize(4097);
+    m_socket.setReadBufferSize(LineLimit + 1);
     reconnect();
 }
 
@@ -33,11 +51,46 @@ SkwdWindowMonitor::~SkwdWindowMonitor()
 QString SkwdWindowMonitor::output() const { return m_output; }
 bool SkwdWindowMonitor::hasPolicy() const { return m_hasPolicy; }
 bool SkwdWindowMonitor::paused() const { return m_paused; }
+bool SkwdWindowMonitor::subscribe() const { return m_subscribe; }
+QVariantMap SkwdWindowMonitor::entry() const { return m_entry; }
+bool SkwdWindowMonitor::hasEntry() const { return m_hasEntry; }
+bool SkwdWindowMonitor::settled() const { return !m_subscribe || m_settled; }
+
+void SkwdWindowMonitor::setSubscribe(bool subscribe)
+{
+    if (m_subscribe == subscribe) return;
+    m_subscribe = subscribe;
+    emit subscribeChanged();
+    emit settledChanged();
+    if (subscribe && !m_settled && !m_hasEntry) m_grace.start(GraceMs);
+    requestAssignments();
+}
+
+void SkwdWindowMonitor::requestAssignments()
+{
+    if (!m_subscribe || !m_capable || m_subscribed || m_output.isEmpty()
+        || m_socket.state() != QLocalSocket::ConnectedState) {
+        return;
+    }
+    const QByteArray line = QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 2}, {QStringLiteral("output"), m_output},
+        {QStringLiteral("subscribe"), QStringLiteral("assignments")}
+    }).toJson(QJsonDocument::Compact) + '\n';
+    m_subscribed = m_socket.write(line) == line.size();
+}
+
+void SkwdWindowMonitor::settle()
+{
+    if (m_settled) return;
+    m_settled = true;
+    m_grace.stop();
+    emit settledChanged();
+}
 
 void SkwdWindowMonitor::receivePolicy()
 {
     while (m_socket.canReadLine()) {
-        const QByteArray line = m_socket.readLine(4097);
+        const QByteArray line = m_socket.readLine(LineLimit + 1);
         const auto value = QJsonDocument::fromJson(line).object();
         if (!line.endsWith('\n') || value.value("version").toInt() != 1 || !value.value("paused").isBool()) {
             m_socket.abort();
@@ -46,8 +99,26 @@ void SkwdWindowMonitor::receivePolicy()
         m_hasPolicy = true;
         m_paused = value.value("paused").toBool();
         emit policyChanged();
+        if (!value.value("capabilities").toArray().contains(QStringLiteral("assignments"))) {
+            settle();
+            if (m_hasEntry) {
+                m_hasEntry = false;
+                m_entry.clear();
+                emit entryChanged();
+            }
+        } else if (!m_capable) {
+            m_capable = true;
+            requestAssignments();
+        }
+        const auto entry = value.value("entry");
+        if (entry.isObject() && (!m_hasEntry || entry.toObject().toVariantMap() != m_entry)) {
+            m_entry = entry.toObject().toVariantMap();
+            m_hasEntry = true;
+            m_grace.stop();
+            emit entryChanged();
+        }
     }
-    if (m_socket.bytesAvailable() >= 4097) m_socket.abort();
+    if (m_socket.bytesAvailable() > LineLimit) m_socket.abort();
 }
 
 void SkwdWindowMonitor::setModel(QAbstractItemModel *model)
@@ -71,19 +142,52 @@ void SkwdWindowMonitor::setModel(QAbstractItemModel *model)
 void SkwdWindowMonitor::setOutput(const QString &output)
 {
     if (m_output == output) return;
+    const bool resubscribe = m_subscribed;
     m_output = output;
     emit outputChanged();
+    if (resubscribe) {
+        m_socket.abort();
+        return;
+    }
     schedule();
+    requestAssignments();
 }
 
 void SkwdWindowMonitor::reconnect()
 {
-    for (const QString &path : {m_runtime, m_directory}) {
-        if (QDir(path).exists() && !m_watcher.directories().contains(path)) m_watcher.addPath(path);
-    }
-    if (!m_runtime.isEmpty() && m_socket.state() == QLocalSocket::UnconnectedState) {
-        m_socket.connectToServer(m_directory + QStringLiteral("/window-state.sock"));
-    }
+    if (m_runtime.isEmpty() || m_socket.state() != QLocalSocket::UnconnectedState) return;
+    watch();
+    const QString path = m_directory + QStringLiteral("/window-state.sock");
+    if (QFileInfo::exists(path)) m_socket.connectToServer(path);
+}
+
+void SkwdWindowMonitor::lost()
+{
+    m_capable = false;
+    m_subscribed = false;
+    m_hasPolicy = false;
+    emit policyChanged();
+    const bool brief = !m_connectedAt.isValid() || m_connectedAt.elapsed() < BriefConnectionMs;
+    m_connectedAt.invalidate();
+    m_failures = brief ? m_failures + 1 : 0;
+    watch();
+    if (m_failures <= RetryLimit) m_retry.start(m_failures == 0 ? 0 : RetryBaseMs << (m_failures - 1));
+}
+
+void SkwdWindowMonitor::watch()
+{
+    if (m_runtime.isEmpty()) return;
+    const QString target = QFileInfo(m_directory).isDir() ? m_directory : m_runtime;
+    const QStringList watched = m_watcher.directories();
+    if (watched.size() == 1 && watched.first() == target) return;
+    if (!watched.isEmpty()) m_watcher.removePaths(watched);
+    m_watcher.addPath(target);
+}
+
+void SkwdWindowMonitor::unwatch()
+{
+    const QStringList watched = m_watcher.directories();
+    if (!watched.isEmpty()) m_watcher.removePaths(watched);
 }
 
 void SkwdWindowMonitor::schedule()

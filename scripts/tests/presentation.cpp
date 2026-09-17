@@ -52,10 +52,32 @@ if mode.startswith('{'):
     streams = []
     for spec in specs:
         fields = dict(item.split('=') for item in spec.split(','))
+        stream = socket.socket(fileno=int(fields['fd']))
+        epoch = 0
+        if 'prelude' in mode:
+            def packet(kind, epoch, rest=bytes(24)):
+                return b'SKDG' + bytes([kind, 0]) + struct.pack('<H', epoch) + rest
+            stream.send(packet(7, 1))
+            assert stream.recv(32) == packet(8, 1)
+            fd = os.open('/dev/null', os.O_RDONLY)
+            geometry = struct.pack('<IIIIQ', 16, 16, 64, 0, 0)
+            stream.sendmsg([packet(1, 1, geometry)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))])
+            os.close(fd)
+            stream.send(packet(2, 1))
+            stream.settimeout(2)
+            try:
+                acked = stream.recv(32) == packet(3, 1)
+            except TimeoutError:
+                acked = False
+            with open(runtime + '/shared.log', 'a') as log:
+                log.write('prelude %s\n' % ('acked' if acked else 'starved'))
+            stream.settimeout(None)
+            stream.send(packet(7, 2))
+            assert stream.recv(32) == packet(8, 2)
+            epoch = 2
         if 'frame_fd' in fields:
             os.write(int(fields['frame_fd']), b'SKWP' + struct.pack('<II', 16, 16) + bytes([0, 255, 0, 255]) * 256)
-        stream = socket.socket(fileno=int(fields['fd']))
-        stream.send(b'SKDG' + bytes([6]) + bytes(27))
+        stream.send(b'SKDG' + bytes([6, 0]) + struct.pack('<H', epoch) + bytes(24))
         streams.append(stream)
     for line in sys.stdin:
         with open(runtime + '/shared.log', 'a') as log:
@@ -213,6 +235,15 @@ sys.stdin.read()
         std::cerr << "unexpected shared spawn: " << spawns.first().toStdString();
         return 13;
     }
+    left.setAssignment(QStringLiteral(R"({"mute":true,"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/loop.mp4"},"transition":{"duration_ms":2000,"effect":"fade","from":"/wall/old.png"},"volume":35})"));
+    if (!settled([&] { return sharedLog().contains("control {\"mute\":true,\"to\":\"DP-1\",\"volume\":35}"); })) {
+        std::cerr << "audio-only change did not reach the running presenter: " << sharedLog().toStdString();
+        return 39;
+    }
+    if (sharedLog().split('\n').filter(QStringLiteral("spawn ")).size() != 1 || !left.workerReady()) {
+        std::cerr << "audio-only change restarted the presenter: " << sharedLog().toStdString();
+        return 40;
+    }
     right.setPaused(true);
     if (!settled([&] { return sharedLog().contains("control {\"pause\":true,\"to\":\"DP-2\"}"); })) {
         std::cerr << "routed pause missing: " << sharedLog().toStdString();
@@ -260,6 +291,28 @@ sys.stdin.read()
     if (stillSpawns.size() != 1 || !stillSpawns.first().contains("frame_fd=4") || !stillSpawns.first().contains("frame_fd=6")) {
         std::cerr << "unexpected still spawn: " << sharedLog().toStdString();
         return 23;
+    }
+    Item transitioned(window.contentItem());
+    transitioned.setSize(QSizeF(32, 32));
+    transitioned.setPaper(helper.fileName());
+    transitioned.setSharedImageDevice("device", "driver");
+    transitioned.setOutput(QStringLiteral("DP-7"));
+    transitioned.componentComplete();
+    const QString transitionedId = QStringLiteral("123-2-3");
+    {
+        QFile file(runtime.path() + "/skwd-paper-plasma/" + transitionedId + ".json");
+        if (!file.open(QIODevice::WriteOnly)) return 36;
+        file.write("{\"state\":\"pending\"}");
+    }
+    transitioned.setPresentationId(transitionedId);
+    transitioned.setAssignment(QStringLiteral(R"({"outputs":["DP-7"],"source":{"kind":"static","path":"/wall/prelude.png"}})"));
+    if (!settled([&] { return reported(transitionedId) && sharedLog().contains("prelude "); })) {
+        std::cerr << "still behind an unusable GPU prelude never presented: " << sharedLog().toStdString();
+        return 37;
+    }
+    if (!sharedLog().contains("prelude acked")) {
+        std::cerr << "skipped GPU prelude frame starved the renderer: " << sharedLog().toStdString();
+        return 38;
     }
     still.setAssignment(QStringLiteral(R"({"outputs":["DP-3"],"source":{"kind":"video","path":"/wall/a.ivf","engine":"tinier","frame_rate":"30/1"}})"));
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);

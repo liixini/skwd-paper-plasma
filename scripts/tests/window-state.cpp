@@ -36,10 +36,10 @@ public:
     void replace(QList<Row> value) { beginResetModel(); rows = value; endResetModel(); }
 };
 
-static void waitFor(const std::function<bool()> &condition) {
+static void waitFor(const std::function<bool()> &condition, qint64 timeout = 3000) {
     QElapsedTimer timer;
     timer.start();
-    while (!condition() && timer.elapsed() < 3000) {
+    while (!condition() && timer.elapsed() < timeout) {
         QCoreApplication::processEvents();
         QThread::msleep(1);
     }
@@ -57,11 +57,10 @@ static void expect(QLocalSocket *socket, bool supported, bool fullscreen, bool m
     }
 }
 
-int main(int argc, char **argv) {
+static void observations() {
     QTemporaryDir workspace;
-    if (!workspace.isValid()) return 1;
+    if (!workspace.isValid()) qFatal("Cannot create a runtime directory");
     qputenv("XDG_RUNTIME_DIR", workspace.path().toUtf8());
-    QCoreApplication application(argc, argv);
     const QString directory = workspace.path() + "/skwd-wall-v2";
     const QString path = directory + "/window-state.sock";
     Tasks tasks;
@@ -102,5 +101,131 @@ int main(int argc, char **argv) {
     expect(socket.get(), true, true, false);
     monitor.setModel(nullptr);
     expect(socket.get(), false, false, false);
+}
+
+struct Session {
+    QTemporaryDir workspace;
+    Tasks tasks;
+    std::unique_ptr<SkwdWindowMonitor> monitor;
+    QLocalServer server;
+    std::unique_ptr<QLocalSocket> socket;
+
+    Session() {
+        if (!workspace.isValid()) qFatal("Cannot create a runtime directory");
+        qputenv("XDG_RUNTIME_DIR", workspace.path().toUtf8());
+        QDir().mkpath(workspace.path() + "/skwd-wall-v2");
+        if (!server.listen(workspace.path() + "/skwd-wall-v2/window-state.sock")) qFatal("Cannot listen for window states");
+        tasks.rows = {{true, false, false}};
+        monitor = std::make_unique<SkwdWindowMonitor>();
+        monitor->setModel(&tasks);
+        monitor->setOutput("DP-1");
+        accept(3000);
+        expect(socket.get(), true, true, false);
+    }
+
+    void accept(qint64 timeout) {
+        waitFor([&] { return server.hasPendingConnections(); }, timeout);
+        socket.reset(server.nextPendingConnection());
+    }
+};
+
+static void peerDropWhileListening() {
+    Session session;
+    for (int round = 0; round < 4; ++round) {
+        session.socket.reset();
+        session.accept(10000);
+        const bool fullscreen = round % 2 == 0;
+        expect(session.socket.get(), true, fullscreen, !fullscreen);
+        session.tasks.replace({{!fullscreen, fullscreen, false}});
+        expect(session.socket.get(), true, !fullscreen, fullscreen);
+    }
+}
+
+static void rejectingPeerIsBounded() {
+    Session session;
+    session.socket.reset();
+    int attempts = 0;
+    QElapsedTimer window;
+    window.start();
+    while (window.elapsed() < 2000) {
+        QCoreApplication::processEvents();
+        while (session.server.hasPendingConnections()) {
+            delete session.server.nextPendingConnection();
+            ++attempts;
+        }
+        QThread::msleep(1);
+    }
+    if (attempts < 2 || attempts > 6) qFatal("Window-state reconnects were not bounded: %d attempts in 2s", attempts);
+    session.accept(10000);
+    expect(session.socket.get(), true, true, false);
+}
+
+static QJsonObject request(QLocalSocket *socket) {
+    waitFor([&] { return socket->canReadLine(); });
+    return QJsonDocument::fromJson(socket->readLine()).object();
+}
+
+static const QJsonObject subscription{
+    {"version", 2}, {"output", "DP-1"}, {"subscribe", "assignments"}
+};
+
+static void pushedAssignmentsSurviveReconnects() {
+    Session session;
+    session.monitor->setSubscribe(true);
+    if (session.monitor->settled()) qFatal("A subscribing monitor settled before the daemon answered");
+    session.socket->write("{\"version\":1,\"paused\":false,\"capabilities\":[\"assignments\"]}\n");
+    session.socket->flush();
+    if (request(session.socket.get()) != subscription) qFatal("Monitor did not subscribe to assignments");
+    session.socket->write("{\"version\":1,\"paused\":false,\"capabilities\":[\"assignments\"],"
+                          "\"entry\":{\"paper\":\"/paper\",\"assignment\":{\"outputs\":[\"DP-1\"]}}}\n");
+    session.socket->flush();
+    waitFor([&] { return session.monitor->hasEntry(); });
+    if (session.monitor->entry().value("paper").toString() != "/paper") qFatal("Pushed entry was not exposed");
+    session.socket.reset();
+    session.accept(10000);
+    expect(session.socket.get(), true, true, false);
+    if (!session.monitor->hasEntry()) qFatal("Reconnecting dropped the last pushed entry");
+    session.socket->write("{\"version\":1,\"paused\":false,\"capabilities\":[\"assignments\"]}\n");
+    session.socket->flush();
+    if (request(session.socket.get()) != subscription) qFatal("Monitor did not resubscribe after reconnecting");
+    session.socket.reset();
+    session.accept(10000);
+    expect(session.socket.get(), true, true, false);
+    session.socket->write("{\"version\":1,\"paused\":false}\n");
+    session.socket->flush();
+    waitFor([&] { return !session.monitor->hasEntry() && session.monitor->settled(); });
+}
+
+static void olderDaemonKeepsConfiguredAssignments() {
+    Session session;
+    session.monitor->setSubscribe(true);
+    session.socket->write("{\"version\":1,\"paused\":false}\n");
+    session.socket->flush();
+    waitFor([&] { return session.monitor->settled(); });
+    QElapsedTimer quiet;
+    quiet.start();
+    while (quiet.elapsed() < 150) QCoreApplication::processEvents();
+    if (session.socket->canReadLine() || session.monitor->hasEntry()) qFatal("Monitor subscribed to a daemon without assignments");
+}
+
+static void missingDaemonSettlesAfterGrace() {
+    QTemporaryDir workspace;
+    if (!workspace.isValid()) qFatal("Cannot create a runtime directory");
+    qputenv("XDG_RUNTIME_DIR", workspace.path().toUtf8());
+    SkwdWindowMonitor monitor;
+    monitor.setOutput("DP-1");
+    monitor.setSubscribe(true);
+    if (monitor.settled()) qFatal("Monitor settled without waiting for the daemon");
+    waitFor([&] { return monitor.settled(); }, 5000);
+}
+
+int main(int argc, char **argv) {
+    QCoreApplication application(argc, argv);
+    observations();
+    peerDropWhileListening();
+    rejectingPeerIsBounded();
+    pushedAssignmentsSurviveReconnects();
+    olderDaemonKeepsConfiguredAssignments();
+    missingDaemonSettlesAfterGrace();
     return 0;
 }

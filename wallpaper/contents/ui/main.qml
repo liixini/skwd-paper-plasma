@@ -18,7 +18,9 @@ WallpaperItem {
     }
 
     property var assignments: parseAssignments(configuration.Assignments || "")
-    property var currentAssignment: assignments[Screen.name] || null
+    property var currentAssignment: windowMonitor.hasEntry
+        ? windowMonitor.entry
+        : (windowMonitor.settled ? (assignments[Screen.name] || null) : null)
 
     TaskManager.VirtualDesktopInfo { id: desktopInfo }
     TaskManager.ActivityInfo { id: activityInfo }
@@ -38,6 +40,7 @@ WallpaperItem {
         id: windowMonitor
         model: windowTasks
         output: root.Screen.name
+        subscribe: Qt.application.name === "plasmashell"
     }
 
     SkwdVideoItem {

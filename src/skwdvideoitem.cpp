@@ -406,11 +406,45 @@ void SkwdVideoItem::setAssignment(const QString &value)
     if (m_assignment == value) {
         return;
     }
-    m_assignment = value;
+    const QString previous = std::exchange(m_assignment, value);
     emit assignmentChanged();
-    if (isComponentComplete()) {
+    if (isComponentComplete() && !retune(previous)) {
         scheduleRestart();
     }
+}
+
+bool SkwdVideoItem::retune(const QString &previous)
+{
+    if (!m_workerReady || !m_error.isEmpty() || m_restartRequired) {
+        return false;
+    }
+    const QJsonObject before = QJsonDocument::fromJson(previous.toUtf8()).object();
+    const QJsonObject after = QJsonDocument::fromJson(m_assignment.toUtf8()).object();
+    auto identity = [](QJsonObject assignment) {
+        for (const auto key : {QStringLiteral("transition"), QStringLiteral("mute"), QStringLiteral("volume")}) {
+            assignment.remove(key);
+        }
+        return assignment;
+    };
+    if (before.isEmpty() || identity(before) != identity(after)) {
+        return false;
+    }
+    const auto kind = after.value(QStringLiteral("source")).toObject().value(QStringLiteral("kind")).toString();
+    const bool audible = kind == QStringLiteral("video") || kind == QStringLiteral("we");
+    if (audible && (before.value(QStringLiteral("mute")) != after.value(QStringLiteral("mute"))
+                    || before.value(QStringLiteral("volume")) != after.value(QStringLiteral("volume")))) {
+        QJsonObject command;
+        command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
+        command.insert(QStringLiteral("mute"), after.value(QStringLiteral("mute")).toBool(false));
+        command.insert(QStringLiteral("volume"), after.value(QStringLiteral("volume")).toInt(0));
+        const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
+        if (m_pooled) {
+            SkwdWorkerPool::instance()->sendControl(this, line);
+        } else {
+            sendControl(line);
+        }
+    }
+    return true;
 }
 
 QString SkwdVideoItem::paper() const
@@ -859,6 +893,10 @@ void SkwdVideoItem::resetStream()
 {
     m_epoch = 0;
     ++m_streamGeneration;
+    m_gpuUnavailable = false;
+    m_lateAcks = false;
+    m_stillStream = QJsonDocument::fromJson(m_assignment.toUtf8()).object().value(QStringLiteral("source")).toObject()
+        .value(QStringLiteral("kind")).toString() == QStringLiteral("static");
     closeDmabuf();
     m_buffer.clear();
     m_stderr.clear();
@@ -945,12 +983,14 @@ void SkwdVideoItem::consumeDmabuf()
             ++m_streamGeneration;
             m_workerReady = false;
             m_frameAccepted = false;
+            m_lateAcks = false;
             bytes[4] = 8;
             ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL);
             continue;
         }
         if (epoch != m_epoch) continue;
         if (bytes[4] == 6 && length == 32) {
+            m_lateAcks = (bytes[8] & 1) != 0;
             m_workerReady = true;
             reportPresentation();
             continue;
@@ -1053,6 +1093,11 @@ void SkwdVideoItem::consumeFrames(const QByteArray &bytes)
     }
 }
 
+bool SkwdVideoItem::slotsExhausted() const
+{
+    return std::all_of(m_outstandingSlots.begin(), m_outstandingSlots.end(), [](bool outstanding) { return outstanding; });
+}
+
 void SkwdVideoItem::scheduleFramePoll()
 {
     const auto generation = m_streamGeneration;
@@ -1064,6 +1109,15 @@ void SkwdVideoItem::scheduleFramePoll()
             if (generation == m_streamGeneration && m_error.isEmpty()) update();
         });
     }, Qt::QueuedConnection);
+}
+
+static QSGNode *presentable(QSGSimpleTextureNode *node)
+{
+    if (node && !node->texture()) {
+        delete node;
+        return nullptr;
+    }
+    return node;
 }
 
 QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
@@ -1135,33 +1189,38 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
                 acknowledge(slot);
             } else if (status == GL_WAIT_FAILED || node->textures[slot].retirementAge.elapsed() >= 2000) {
                 frameFailed(QStringLiteral("Wallpaper GPU frame release did not complete"));
-                return node;
+                return presentable(node);
             } else {
                 retiring = true;
             }
         }
     }
-    if (retiring) scheduleFramePoll();
+    if (retiring && (!m_lateAcks || slotsExhausted())) scheduleFramePoll();
     if (pending >= 0) {
         for (int slot : pendingSlots) {
-            bool imported;
-            {
+            bool imported = false;
+            if (!m_gpuUnavailable) {
                 QMutexLocker lock(&m_frameMutex);
                 imported = node->import(slot, m_slots[slot], window());
             }
-            if (!imported) {
-                frameFailed(QStringLiteral("Cannot import the wallpaper GPU frame on this graphics device"));
-                return node;
+            const bool waited = imported && node->wait(slot);
+            if (waited) continue;
+            if (m_stillStream) {
+                if (!m_gpuUnavailable) {
+                    qWarning() << "skwd-paper-plasma: GPU transition frames unavailable, presenting the still frame only";
+                    m_gpuUnavailable = true;
+                }
+                for (int skipped : pendingSlots) acknowledge(skipped);
+                return presentable(node);
             }
-            if (!node->wait(slot)) {
-                frameFailed(QStringLiteral("Cannot wait for the wallpaper GPU frame"));
-                return node;
-            }
+            frameFailed(imported ? QStringLiteral("Cannot wait for the wallpaper GPU frame")
+                                 : QStringLiteral("Cannot import the wallpaper GPU frame on this graphics device"));
+            return presentable(node);
         }
         if (node->currentSlot >= 0 && node->currentSlot != pending) {
             if (!node->retire(node->currentSlot)) {
                 frameFailed(QStringLiteral("Cannot track wallpaper GPU frame release"));
-                return node;
+                return presentable(node);
             }
             retiring = true;
         }
@@ -1169,21 +1228,21 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             if (slot != pending) {
                 if (!node->retire(slot)) {
                     frameFailed(QStringLiteral("Cannot track wallpaper GPU frame release"));
-                    return node;
+                    return presentable(node);
                 }
                 retiring = true;
             }
         }
         if (retiring) {
             glFlush();
-            scheduleFramePoll();
+            if (!m_lateAcks || slotsExhausted()) scheduleFramePoll();
         }
         node->setTexture(node->textures[pending].texture);
         node->setOwnsTexture(false);
         node->currentSlot = pending;
         node->generation = generation;
         frameAccepted();
-        return node;
+        return presentable(node);
     }
     QByteArray frame;
     int frameWidth;
@@ -1191,7 +1250,7 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     {
         QMutexLocker lock(&m_frameMutex);
         if (generation == node->generation || m_frame.isEmpty()) {
-            return node;
+            return presentable(node);
         }
         frame = m_frame;
         frameWidth = m_frameWidth;
@@ -1199,7 +1258,14 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     }
     if (frameWidth <= 0 || frameHeight <= 0
         || frame.size() != qsizetype(frameWidth) * qsizetype(frameHeight) * 4) {
-        return node;
+        return presentable(node);
+    }
+    if (node->currentSlot >= 0) {
+        delete node;
+        node = new SkwdFrameNode;
+        node->streamGeneration = m_streamGeneration;
+        node->setFiltering(QSGTexture::Linear);
+        node->setRect(boundingRect());
     }
     const QImage borrowed(reinterpret_cast<const uchar *>(frame.constData()), frameWidth,
         frameHeight, frameWidth * 4, QImage::Format_RGBA8888);
@@ -1207,16 +1273,16 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     // wrapping QByteArray storage does not keep that storage alive, so detach into owned pixels.
     const QImage image = borrowed.copy();
     if (image.isNull()) {
-        return node;
+        return presentable(node);
     }
     QSGTexture *texture = window()->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
     if (!texture) {
         frameFailed(QStringLiteral("Cannot upload the wallpaper frame"));
-        return node;
+        return presentable(node);
     }
     node->setTexture(texture);
     node->setOwnsTexture(true);
     node->generation = generation;
     frameAccepted();
-    return node;
+    return presentable(node);
 }
