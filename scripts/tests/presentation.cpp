@@ -47,8 +47,9 @@ if mode.startswith('{'):
         sys.stdout.buffer.flush()
         sys.stdin.read()
         sys.exit(0)
+    size = sys.argv[sys.argv.index('--stream-size') + 1] if '--stream-size' in sys.argv else ''
     with open(runtime + '/shared.log', 'a') as log:
-        log.write('spawn %d %s %s\n' % (os.getpid(), mode, ' '.join(specs)))
+        log.write('spawn %d %s %s %s\n' % (os.getpid(), mode, ' '.join(specs), size))
     streams = []
     for spec in specs:
         fields = dict(item.split('=') for item in spec.split(','))
@@ -352,6 +353,64 @@ sys.stdin.read()
         || !legacyRuns.at(1).contains("--stream-fd 3") || legacyRuns.at(1).contains("--stream fd=")) {
         std::cerr << "unexpected legacy sequence: " << sharedLog().toStdString();
         return 27;
+    }
+    Item lockWide(window.contentItem());
+    Item lockPortrait(window.contentItem());
+    for (auto *shared : {&lockWide, &lockPortrait}) {
+        shared->setSize(QSizeF(32, 32));
+        shared->setPaper(helper.fileName());
+        shared->componentComplete();
+    }
+    lockWide.setOutput(QStringLiteral("DP-8"));
+    lockPortrait.setOutput(QStringLiteral("DP-9"));
+    lockWide.setStreamWidth(2560);
+    lockWide.setStreamHeight(1440);
+    lockPortrait.setStreamWidth(2162);
+    lockPortrait.setStreamHeight(3841);
+    lockWide.setAssignment(QStringLiteral(R"({"outputs":["*"],"source":{"kind":"static","path":"/wall/lock.png"}})"));
+    lockPortrait.setAssignment(QStringLiteral(R"({"outputs":["*"],"source":{"kind":"static","path":"/wall/lock.png"}})"));
+    if (!settled([&] { return sharedLog().contains("lock.png"); })) {
+        std::cerr << "shared lock-screen still never spawned: " << sharedLog().toStdString();
+        return 41;
+    }
+    const auto lockSpawns = sharedLog().split('\n').filter(QStringLiteral("lock.png"));
+    if (lockSpawns.size() != 1 || !lockSpawns.first().contains("size=2560x1440,fps=30,output=DP-8")
+        || !lockSpawns.first().contains("size=2160x3838,fps=30,output=DP-9")) {
+        std::cerr << "still streams must fit the 3840x2160 renderer budget: " << sharedLog().toStdString();
+        return 42;
+    }
+    Item portraitVideo(window.contentItem());
+    portraitVideo.setSize(QSizeF(32, 32));
+    portraitVideo.setPaper(helper.fileName());
+    portraitVideo.setSharedImageDevice("device", "driver");
+    portraitVideo.setOutput(QStringLiteral("DP-10"));
+    portraitVideo.componentComplete();
+    portraitVideo.setStreamWidth(2880);
+    portraitVideo.setStreamHeight(5120);
+    portraitVideo.setAssignment(QStringLiteral(R"({"outputs":["DP-10"],"source":{"kind":"video","path":"/wall/portrait.mp4"}})"));
+    if (!settled([&] { return sharedLog().contains("portrait.mp4"); })) {
+        std::cerr << "portrait video never spawned: " << sharedLog().toStdString();
+        return 43;
+    }
+    if (!sharedLog().contains("size=2880x5120,fps=30,output=DP-10")) {
+        std::cerr << "GPU video streams keep the portrait output size: " << sharedLog().toStdString();
+        return 44;
+    }
+    Item tinierWide(window.contentItem());
+    tinierWide.setSize(QSizeF(32, 32));
+    tinierWide.setPaper(helper.fileName());
+    tinierWide.setOutput(QStringLiteral("DP-11"));
+    tinierWide.componentComplete();
+    tinierWide.setStreamWidth(5120);
+    tinierWide.setStreamHeight(2880);
+    tinierWide.setAssignment(QStringLiteral(R"({"outputs":["DP-11"],"source":{"kind":"video","path":"/wall/wide.ivf","engine":"tinier","frame_rate":"30/1"}})"));
+    if (!settled([&] { return sharedLog().contains("wide.ivf"); })) {
+        std::cerr << "tinier video never spawned: " << sharedLog().toStdString();
+        return 45;
+    }
+    if (tinierWide.sharesWorker() || !sharedLog().split('\n').filter(QStringLiteral("wide.ivf")).first().endsWith(" 3840x2160")) {
+        std::cerr << "direct tinier streams must fit the renderer budget: " << sharedLog().toStdString();
+        return 46;
     }
     auto *stubborn = new Item(window.contentItem());
     stubborn->setSize(QSizeF(32, 32));

@@ -33,6 +33,7 @@
 #include <array>
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -41,6 +42,9 @@
 
 namespace {
 constexpr int SlotCount = 3;
+constexpr int MinStreamEdge = 16;
+constexpr int MaxStreamEdge = 8192;
+constexpr qint64 FrameStreamPixels = qint64(3840) * 2160;
 
 struct ReceivedDescriptor {
     int fd = -1;
@@ -55,6 +59,24 @@ quint32 read32(const uchar *data)
 quint64 read64(const uchar *data)
 {
     return qFromLittleEndian<quint64>(data);
+}
+
+QSize fitFrameStream(int width, int height)
+{
+    if (qint64(width) * height <= FrameStreamPixels) {
+        return {width, height};
+    }
+    const double scale = std::sqrt(double(FrameStreamPixels) / (double(width) * double(height)));
+    width = qMax(MinStreamEdge, int(width * scale));
+    height = qMax(MinStreamEdge, int(height * scale));
+    while (qint64(width) * height > FrameStreamPixels) {
+        if (width >= height) {
+            --width;
+        } else {
+            --height;
+        }
+    }
+    return {width, height};
 }
 
 class SkwdFrameNode final : public QSGSimpleTextureNode {
@@ -471,7 +493,7 @@ int SkwdVideoItem::streamWidth() const
 
 void SkwdVideoItem::setStreamWidth(int value)
 {
-    value = qBound(16, value, 7680);
+    value = qBound(MinStreamEdge, value, MaxStreamEdge);
     if (m_streamWidth == value) {
         return;
     }
@@ -489,7 +511,7 @@ int SkwdVideoItem::streamHeight() const
 
 void SkwdVideoItem::setStreamHeight(int value)
 {
-    value = qBound(16, value, 4320);
+    value = qBound(MinStreamEdge, value, MaxStreamEdge);
     if (m_streamHeight == value) {
         return;
     }
@@ -715,8 +737,12 @@ QByteArray SkwdVideoItem::workerKey() const
 SkwdVideoItem::StreamSpec SkwdVideoItem::streamSpec() const
 {
     const auto source = QJsonDocument::fromJson(m_assignment.toUtf8()).object().value(QStringLiteral("source")).toObject();
-    const bool cpuFrames = source.value(QStringLiteral("kind")).toString() == QStringLiteral("static");
-    return {m_streamWidth, m_streamHeight, m_streamFps, m_output, m_paused, cpuFrames};
+    const QString kind = source.value(QStringLiteral("kind")).toString();
+    const bool cpuFrames = kind == QStringLiteral("static");
+    const bool budgeted = cpuFrames
+        || (kind == QStringLiteral("video") && source.value(QStringLiteral("engine")).toString() == QStringLiteral("tinier"));
+    const QSize size = budgeted ? fitFrameStream(m_streamWidth, m_streamHeight) : QSize(m_streamWidth, m_streamHeight);
+    return {size.width(), size.height(), m_streamFps, m_output, m_paused, cpuFrames};
 }
 
 int SkwdVideoItem::beginSharedFrames()
@@ -866,10 +892,11 @@ void SkwdVideoItem::restart()
         }
         if (!isolateSkwdProcessDescriptors(4)) ::_exit(127);
     });
+    const auto spec = streamSpec();
     QStringList arguments {QStringLiteral("present-plasma"),
             QStringLiteral("--assignment"), m_assignment,
             QStringLiteral("--stream-size"),
-            QStringLiteral("%1x%2").arg(m_streamWidth).arg(m_streamHeight),
+            QStringLiteral("%1x%2").arg(spec.width).arg(spec.height),
             QStringLiteral("--stream-fps"), QString::number(m_streamFps),
             QStringLiteral("--stream-fd"), QStringLiteral("3")};
     if (m_paused) {
