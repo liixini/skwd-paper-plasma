@@ -196,6 +196,34 @@ static void pushedAssignmentsSurviveReconnects() {
     waitFor([&] { return !session.monitor->hasEntry() && session.monitor->settled(); });
 }
 
+static void outputChangesDiscardCachedAssignments() {
+    Session session;
+    session.monitor->setSubscribe(true);
+    session.socket->write("{\"version\":1,\"paused\":true,\"capabilities\":[\"assignments\"],"
+                          "\"entry\":{\"paper\":\"/paper-first\",\"assignment\":{\"outputs\":[\"DP-1\"]}}}\n");
+    session.socket->flush();
+    waitFor([&] { return session.monitor->hasEntry(); });
+    if (request(session.socket.get()) != subscription) qFatal("Monitor did not subscribe to its first output");
+    session.monitor->setOutput("DP-2");
+    if (session.monitor->hasEntry() || session.monitor->hasPolicy() || session.monitor->settled()) {
+        qFatal("Changing outputs retained the previous output's assignment or policy");
+    }
+    session.socket.reset();
+    session.accept(10000);
+    if (request(session.socket.get())["output"] != "DP-2") qFatal("New observation names the old output");
+    session.socket->write("{\"version\":1,\"paused\":false,\"capabilities\":[\"assignments\"]}\n");
+    session.socket->flush();
+    const QJsonObject nextSubscription {{"version", 2}, {"output", "DP-2"}, {"subscribe", "assignments"}};
+    if (request(session.socket.get()) != nextSubscription) qFatal("Monitor did not subscribe to the new output");
+    waitFor([&] { return session.monitor->settled(); });
+    if (session.monitor->hasEntry() || session.monitor->paused()) qFatal("New output did not fall back to its configured assignment");
+    session.socket->write("{\"version\":1,\"paused\":false,\"capabilities\":[\"assignments\"],"
+                          "\"entry\":{\"paper\":\"/paper-second\",\"assignment\":{\"outputs\":[\"DP-2\"]}}}\n");
+    session.socket->flush();
+    waitFor([&] { return session.monitor->hasEntry(); });
+    if (session.monitor->entry()["paper"] != "/paper-second") qFatal("Delayed assignment did not replace the configured fallback");
+}
+
 static void olderDaemonKeepsConfiguredAssignments() {
     Session session;
     session.monitor->setSubscribe(true);
@@ -225,6 +253,7 @@ int main(int argc, char **argv) {
     peerDropWhileListening();
     rejectingPeerIsBounded();
     pushedAssignmentsSurviveReconnects();
+    outputChangesDiscardCachedAssignments();
     olderDaemonKeepsConfiguredAssignments();
     missingDaemonSettlesAfterGrace();
     return 0;

@@ -453,18 +453,20 @@ bool SkwdVideoItem::retune(const QString &previous)
     }
     const auto kind = after.value(QStringLiteral("source")).toObject().value(QStringLiteral("kind")).toString();
     const bool audible = kind == QStringLiteral("video") || kind == QStringLiteral("we");
+    QByteArray line;
     if (audible && (before.value(QStringLiteral("mute")) != after.value(QStringLiteral("mute"))
                     || before.value(QStringLiteral("volume")) != after.value(QStringLiteral("volume")))) {
         QJsonObject command;
-        command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
-        command.insert(QStringLiteral("mute"), after.value(QStringLiteral("mute")).toBool(false));
-        command.insert(QStringLiteral("volume"), after.value(QStringLiteral("volume")).toInt(0));
-        const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
-        if (m_pooled) {
-            SkwdWorkerPool::instance()->sendControl(this, line);
-        } else {
-            sendControl(line);
-        }
+        command.insert(QStringLiteral("to"), QString());
+        command.insert(QStringLiteral("mute"), after.value(QStringLiteral("mute")).toBool(true));
+        command.insert(QStringLiteral("volume"), after.value(QStringLiteral("volume")).toInt(80));
+        line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
+    }
+    if (m_pooled) {
+        return SkwdWorkerPool::instance()->retune(this, line);
+    }
+    if (!line.isEmpty()) {
+        sendControl(line);
     }
     return true;
 }

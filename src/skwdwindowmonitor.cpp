@@ -144,6 +144,21 @@ void SkwdWindowMonitor::setOutput(const QString &output)
     if (m_output == output) return;
     const bool resubscribe = m_subscribed;
     m_output = output;
+    // Cached assignments survive a reconnect only for the same connector.
+    // A new connector gets its own subscription and fallback grace period.
+    if (m_hasEntry) {
+        m_hasEntry = false;
+        m_entry.clear();
+        emit entryChanged();
+    }
+    m_hasPolicy = false;
+    m_paused = false;
+    emit policyChanged();
+    if (m_settled) {
+        m_settled = false;
+        emit settledChanged();
+    }
+    if (m_subscribe) m_grace.start(GraceMs);
     emit outputChanged();
     if (resubscribe) {
         m_socket.abort();

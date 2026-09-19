@@ -8,6 +8,7 @@
 #include <QThread>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <iostream>
 #include <signal.h>
 #include <cerrno>
@@ -31,7 +32,7 @@ int main(int argc, char **argv)
     QFile helper(runtime.path() + "/presenter");
     if (!helper.open(QIODevice::WriteOnly)) return 1;
     helper.write(R"PY(#!/usr/bin/python3
-import os, socket, struct, sys, signal, array
+import os, socket, struct, sys, signal, array, json
 mode = sys.argv[sys.argv.index('--assignment') + 1]
 if mode.startswith('{'):
     runtime = os.environ['XDG_RUNTIME_DIR']
@@ -50,6 +51,8 @@ if mode.startswith('{'):
     size = sys.argv[sys.argv.index('--stream-size') + 1] if '--stream-size' in sys.argv else ''
     with open(runtime + '/shared.log', 'a') as log:
         log.write('spawn %d %s %s %s\n' % (os.getpid(), mode, ' '.join(specs), size))
+    with open(runtime + '/events.jsonl', 'a') as log:
+        log.write(json.dumps({'kind': 'spawn', 'pid': os.getpid(), 'assignment': json.loads(mode)}) + '\n')
     streams = []
     for spec in specs:
         fields = dict(item.split('=') for item in spec.split(','))
@@ -83,6 +86,8 @@ if mode.startswith('{'):
     for line in sys.stdin:
         with open(runtime + '/shared.log', 'a') as log:
             log.write('control ' + line)
+        with open(runtime + '/events.jsonl', 'a') as log:
+            log.write(json.dumps({'kind': 'control', 'pid': os.getpid(), 'command': json.loads(line)}) + '\n')
     sys.exit(0)
 if mode == 'stubborn':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -126,9 +131,13 @@ if mode in ('epochs', 'stale'):
 if mode == 'fail':
     sys.stderr.write('synthetic export unavailable\n')
     sys.exit(2)
-if mode in ('ready', 'stubborn'):
+if mode in ('ready', 'stubborn', 'pattern', 'changed-pattern'):
     socket.socket(fileno=3).send(b'SKDG' + bytes([6]) + bytes(27))
-sys.stdout.buffer.write(b'SKWP' + struct.pack('<II',16,16) + bytes([255,0,0,255])*256)
+pixels = bytes([255,0,0,255])*256
+if mode in ('pattern', 'changed-pattern'):
+    left, right = ((255, 0, 0, 255), (0, 0, 255, 255)) if mode == 'pattern' else ((0, 255, 0, 255), (255, 255, 0, 255))
+    pixels = (bytes(left) * 8 + bytes(right) * 8) * 16
+sys.stdout.buffer.write(b'SKWP' + struct.pack('<II',16,16) + pixels)
 sys.stdout.buffer.flush()
 if mode == 'stale':
     sys.exit(0)
@@ -176,6 +185,20 @@ sys.stdin.read()
     window.show();
     if (!check("ready", "ready")) return 2;
     if (!check("ready", "ready")) return 3;
+    auto visiblePixels = [&](const QString &name, const QColor &left, const QColor &right) {
+        const auto frame = window.grabWindow();
+        const bool correct = !frame.isNull() && frame.pixelColor(8, 16) == left && frame.pixelColor(24, 16) == right;
+        const QString artifacts = qEnvironmentVariable("SKWD_TEST_ARTIFACT_DIR");
+        if (!artifacts.isEmpty()) {
+            QDir().mkpath(artifacts);
+            if (!frame.save(artifacts + "/" + name + ".png")) return false;
+        }
+        if (!correct) std::cerr << "visible pixels did not match " << name.toStdString() << std::endl;
+        return correct;
+    };
+    if (!visiblePixels("red", Qt::red, Qt::red)) return 66;
+    if (!check("pattern", "ready") || !visiblePixels("pattern", Qt::red, Qt::blue)) return 67;
+    if (!check("changed-pattern", "ready") || !visiblePixels("changed-pattern", Qt::green, Qt::yellow)) return 68;
     const int descriptors = QDir("/proc/self/fd").entryList(QDir::AllEntries | QDir::NoDotAndDotDot).size();
     if (!check("fdspam", "ready")) return 30;
     const int afterSpam = QDir("/proc/self/fd").entryList(QDir::AllEntries | QDir::NoDotAndDotDot).size();
@@ -236,14 +259,67 @@ sys.stdin.read()
         std::cerr << "unexpected shared spawn: " << spawns.first().toStdString();
         return 13;
     }
-    left.setAssignment(QStringLiteral(R"({"mute":true,"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/loop.mp4"},"transition":{"duration_ms":2000,"effect":"fade","from":"/wall/old.png"},"volume":35})"));
-    if (!settled([&] { return sharedLog().contains("control {\"mute\":true,\"to\":\"DP-1\",\"volume\":35}"); })) {
-        std::cerr << "audio-only change did not reach the running presenter: " << sharedLog().toStdString();
+    auto events = [&] {
+        QFile file(runtime.path() + "/events.jsonl");
+        QList<QJsonObject> values;
+        if (file.open(QIODevice::ReadOnly)) {
+            for (const auto &line : file.readAll().split('\n')) {
+                const auto value = QJsonDocument::fromJson(line).object();
+                if (!value.isEmpty()) values.append(value);
+            }
+        }
+        return values;
+    };
+    auto spawnCount = [&] {
+        int count = 0;
+        for (const auto &event : events()) count += event["kind"] == "spawn";
+        return count;
+    };
+    auto lastSpawn = [&](const QString &output) {
+        QJsonObject latest;
+        for (const auto &event : events()) {
+            if (event["kind"] == "spawn"
+                && event["assignment"].toObject()["outputs"].toArray().contains(output)) latest = event;
+        }
+        return latest;
+    };
+    auto audioReceived = [&](int pid, bool mute, int volume, qsizetype after = 0) {
+        for (const auto &event : events().mid(after)) {
+            const auto command = event["command"].toObject();
+            if (event["kind"] == "control" && event["pid"].toInt() == pid
+                && command["to"].isString() && command["to"].toString().isEmpty()
+                && command["mute"] == mute && command["volume"] == volume) return true;
+        }
+        return false;
+    };
+    auto assignment = [](const QString &output, const QString &path, bool mute, int volume, bool transition = false) {
+        QJsonObject value {{"outputs", QJsonArray {output}},
+                           {"source", QJsonObject {{"kind", "video"}, {"path", path}}},
+                           {"mute", mute}, {"volume", volume}};
+        if (transition) value["transition"] = QJsonObject {{"duration_ms", 2000}, {"effect", "fade"}, {"from", "/wall/old.png"}};
+        return QString::fromUtf8(QJsonDocument(value).toJson(QJsonDocument::Compact));
+    };
+    left.setAssignment(assignment("DP-1", "/wall/loop.mp4", true, 35));
+    if (!settled([&] { return spawnCount() == 3 && left.workerReady() && right.workerReady(); })) {
+        std::cerr << "divergent audio settings did not split presenters: " << sharedLog().toStdString();
         return 39;
     }
-    if (sharedLog().split('\n').filter(QStringLiteral("spawn ")).size() != 1 || !left.workerReady()) {
-        std::cerr << "audio-only change restarted the presenter: " << sharedLog().toStdString();
+    const auto leftSplit = lastSpawn("DP-1");
+    const auto rightSplit = lastSpawn("DP-2");
+    if (leftSplit["pid"] == rightSplit["pid"]
+        || leftSplit["assignment"].toObject()["mute"] != true
+        || leftSplit["assignment"].toObject()["volume"] != 35
+        || rightSplit["assignment"].toObject().contains("mute")
+        || rightSplit["assignment"].toObject().contains("volume")) {
+        std::cerr << "audio split changed the other output's assignment: " << sharedLog().toStdString();
         return 40;
+    }
+    right.setAssignment(assignment("DP-2", "/wall/loop.mp4", true, 35));
+    if (!settled([&] { return spawnCount() == 4 && left.workerReady() && right.workerReady(); })) return 47;
+    if (lastSpawn("DP-1")["pid"] != lastSpawn("DP-2")["pid"]
+        || lastSpawn("DP-1")["assignment"].toObject()["outputs"].toArray().size() != 2) {
+        std::cerr << "matching audio settings did not rejoin presenters: " << sharedLog().toStdString();
+        return 48;
     }
     right.setPaused(true);
     if (!settled([&] { return sharedLog().contains("control {\"pause\":true,\"to\":\"DP-2\"}"); })) {
@@ -251,13 +327,93 @@ sys.stdin.read()
         return 14;
     }
     right.setAssignment(QStringLiteral(R"({"outputs":["DP-2"],"source":{"kind":"video","path":"/wall/other.mp4"}})"));
-    if (!settled([&] { return sharedLog().split('\n').filter(QStringLiteral("spawn ")).size() == 3; })) {
+    if (!settled([&] { return spawnCount() == 6; })) {
         std::cerr << "split did not respawn both presenters: " << sharedLog().toStdString();
         return 15;
     }
     if (!settled([&] { return left.workerReady() && right.workerReady(); })) return 16;
-    const auto respawns = sharedLog().split('\n').filter(QStringLiteral("spawn "));
-    if (!respawns.last().contains("other.mp4") && !respawns.at(1).contains("other.mp4")) return 17;
+    if (lastSpawn("DP-2")["assignment"].toObject()["source"].toObject()["path"] != "/wall/other.mp4"
+        || lastSpawn("DP-1")["assignment"].toObject()["source"].toObject()["path"] != "/wall/loop.mp4") return 17;
+    {
+        Item solo(window.contentItem());
+        auto configure = [&](Item &target, const QString &output) {
+            target.setSize(QSizeF(32, 32));
+            target.setPaper(helper.fileName());
+            target.setSharedImageDevice("device", "driver");
+            target.setOutput(output);
+            target.componentComplete();
+        };
+        configure(solo, "RETUNE-1");
+        solo.setAssignment(assignment("RETUNE-1", "/wall/retune.mp4", false, 80));
+        if (!settled([&] { return solo.workerReady(); })) return 49;
+        const int originalPid = lastSpawn("RETUNE-1")["pid"].toInt();
+        const int originalSpawns = spawnCount();
+        solo.setAssignment(assignment("RETUNE-1", "/wall/retune.mp4", true, 35));
+        if (!settled([&] { return audioReceived(originalPid, true, 35); })) {
+            std::cerr << "lone audio retune did not send an audio command: " << sharedLog().toStdString();
+            return 50;
+        }
+        if (spawnCount() != originalSpawns || !solo.workerReady()) return 51;
+        QJsonObject omitted = QJsonDocument::fromJson(assignment("RETUNE-1", "/wall/retune.mp4", true, 80).toUtf8()).object();
+        omitted.remove("mute");
+        omitted.remove("volume");
+        solo.setAssignment(QString::fromUtf8(QJsonDocument(omitted).toJson(QJsonDocument::Compact)));
+        if (!settled([&] { return audioReceived(originalPid, true, 80); })) {
+            std::cerr << "omitted audio settings did not restore Paper defaults: " << sharedLog().toStdString();
+            return 62;
+        }
+        omitted["mute"] = false;
+        solo.setAssignment(QString::fromUtf8(QJsonDocument(omitted).toJson(QJsonDocument::Compact)));
+        if (!settled([&] { return audioReceived(originalPid, false, 80); })) return 63;
+        const auto beforeExplicit = events().size();
+        solo.setAssignment(assignment("RETUNE-1", "/wall/retune.mp4", true, 35));
+        if (!settled([&] { return audioReceived(originalPid, true, 35, beforeExplicit); })) return 64;
+        if (spawnCount() != originalSpawns || !solo.workerReady()) return 65;
+        Item oldSettings(window.contentItem());
+        configure(oldSettings, "RETUNE-2");
+        oldSettings.setAssignment(assignment("RETUNE-2", "/wall/retune.mp4", false, 80));
+        if (!settled([&] { return oldSettings.workerReady(); })) return 52;
+        if (spawnCount() != originalSpawns + 1 || lastSpawn("RETUNE-1")["pid"] != originalPid
+            || lastSpawn("RETUNE-2")["pid"] == originalPid) {
+            std::cerr << "new output joined a stale audio key: " << sharedLog().toStdString();
+            return 53;
+        }
+        {
+            Item matching(window.contentItem());
+            configure(matching, "RETUNE-3");
+            matching.setAssignment(assignment("RETUNE-3", "/wall/retune.mp4", true, 35));
+            if (!settled([&] { return matching.workerReady() && solo.workerReady(); })) return 54;
+            if (lastSpawn("RETUNE-1")["pid"] != lastSpawn("RETUNE-3")["pid"]
+                || lastSpawn("RETUNE-1")["pid"] == lastSpawn("RETUNE-2")["pid"]) return 55;
+        }
+        const int afterDetach = spawnCount();
+        if (!settled([&] { return spawnCount() == afterDetach + 1 && solo.workerReady(); })) return 56;
+        const int transitionPid = lastSpawn("RETUNE-1")["pid"].toInt();
+        const int beforeTransition = spawnCount();
+        const auto transitionAssignment = assignment("RETUNE-1", "/wall/retune.mp4", true, 35, true);
+        solo.setAssignment(transitionAssignment);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        if (spawnCount() != beforeTransition || !solo.workerReady()) return 57;
+        {
+            Item transitioned(window.contentItem());
+            configure(transitioned, "RETUNE-4");
+            transitioned.setAssignment(assignment("RETUNE-4", "/wall/retune.mp4", true, 35, true));
+            if (!settled([&] { return transitioned.workerReady() && solo.workerReady(); })) return 58;
+            if (lastSpawn("RETUNE-1")["pid"] != lastSpawn("RETUNE-4")["pid"]
+                || lastSpawn("RETUNE-1")["pid"] == transitionPid) {
+                std::cerr << "transition-only retune left a stale pool key: " << sharedLog().toStdString();
+                return 59;
+            }
+        }
+        const int pendingSpawns = spawnCount();
+        solo.setAssignment(assignment("RETUNE-1", "/wall/retune.mp4", false, 62, true));
+        if (!settled([&] { return spawnCount() == pendingSpawns + 1 && solo.workerReady(); })) {
+            std::cerr << "retune lost a queued presenter restart: " << sharedLog().toStdString();
+            return 60;
+        }
+        const auto pendingAssignment = lastSpawn("RETUNE-1")["assignment"].toObject();
+        if (pendingAssignment["mute"] != false || pendingAssignment["volume"] != 62) return 61;
+    }
     Item still(window.contentItem());
     Item stillTwo(window.contentItem());
     for (auto *shared : {&still, &stillTwo}) {

@@ -16,6 +16,7 @@ public:
     static SkwdWorkerPool *instance();
 
     void update(SkwdVideoItem *item);
+    bool retune(SkwdVideoItem *item, const QByteArray &line);
     void detach(SkwdVideoItem *item);
     bool sendControl(SkwdVideoItem *item, const QByteArray &line);
     int workerCount() const;

@@ -93,6 +93,26 @@ void SkwdWorkerPool::update(SkwdVideoItem *item)
     scheduleSpawn(current);
 }
 
+bool SkwdWorkerPool::retune(SkwdVideoItem *item, const QByteArray &line)
+{
+    auto *worker = m_membership.value(item);
+    if (!worker || worker->process->state() != QProcess::Running) {
+        return false;
+    }
+    const QByteArray key = item->workerKey();
+    if (worker->spawnScheduled
+        || (worker->key != key && (worker->members.size() > 1 || m_workers.contains(key)))) {
+        update(item);
+        return true;
+    }
+    if (worker->key != key) {
+        m_workers.remove(worker->key);
+        worker->key = key;
+        m_workers.insert(key, worker);
+    }
+    return line.isEmpty() || sendControl(item, line);
+}
+
 void SkwdWorkerPool::detach(SkwdVideoItem *item)
 {
     auto *worker = m_membership.take(item);
