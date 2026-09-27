@@ -9,13 +9,9 @@
 #include <QDebug>
 #include <QProcessEnvironment>
 #include <QTimer>
-#include <array>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
-
-namespace {
-constexpr int MaxSharedStreams = 32;
-}
 
 SkwdWorkerPool *SkwdWorkerPool::instance()
 {
@@ -39,6 +35,7 @@ SkwdWorkerPool::Worker *SkwdWorkerPool::workerFor(const QByteArray &key)
     if (!worker) {
         worker = new Worker;
         worker->key = key;
+        worker->serial = ++m_nextWorkerSerial;
         createProcess(worker);
         m_workers.insert(key, worker);
     }
@@ -143,8 +140,10 @@ void SkwdWorkerPool::scheduleSpawn(Worker *worker)
     }
     worker->spawnScheduled = true;
     const QByteArray key = worker->key;
-    QTimer::singleShot(0, this, [this, key, worker] {
-        if (m_workers.value(key) != worker) {
+    const quint64 serial = worker->serial;
+    QTimer::singleShot(0, this, [this, key, serial] {
+        auto *worker = m_workers.value(key);
+        if (!worker || worker->serial != serial) {
             return;
         }
         worker->spawnScheduled = false;
@@ -205,28 +204,26 @@ void SkwdWorkerPool::spawn(Worker *worker)
     QJsonArray outputs;
     QStringList streams;
     for (auto *member : std::as_const(worker->members)) {
-        if (childSockets.size() + 2 > MaxSharedStreams) {
-            member->sharedWorkerFailed(QStringLiteral("Too many outputs share one wallpaper renderer"));
-            continue;
-        }
+        const auto spec = member->streamSpec();
         const int child = member->beginSharedStream();
         if (child < 0) {
             continue;
         }
-        const auto spec = member->streamSpec();
-        outputs.append(spec.output);
         QString stream = QStringLiteral("fd=%1,size=%2x%3,fps=%4,output=%5,paused=%6")
             .arg(3 + childSockets.size()).arg(spec.width).arg(spec.height).arg(spec.fps)
-            .arg(spec.output).arg(spec.paused ? 1 : 0);
-        childSockets.append(child);
+            .arg(spec.id).arg(spec.paused ? 1 : 0);
+        int frames = -1;
         if (spec.cpuFrames) {
-            const int frames = member->beginSharedFrames();
+            frames = member->beginSharedFrames();
             if (frames < 0) {
+                ::close(child);
                 continue;
             }
-            stream += QStringLiteral(",frame_fd=%1").arg(3 + childSockets.size());
-            childSockets.append(frames);
+            stream += QStringLiteral(",frame_fd=%1").arg(4 + childSockets.size());
         }
+        childSockets.append(child);
+        if (frames >= 0) childSockets.append(frames);
+        if (!outputs.contains(spec.output)) outputs.append(spec.output);
         streams.append(stream);
     }
     if (childSockets.isEmpty()) {
@@ -240,14 +237,10 @@ void SkwdWorkerPool::spawn(Worker *worker)
     for (const auto &stream : streams) {
         arguments << QStringLiteral("--stream") << stream;
     }
-    std::array<int, MaxSharedStreams> sockets {};
-    sockets.fill(-1);
-    for (int index = 0; index < childSockets.size(); ++index) {
-        sockets[index] = childSockets[index];
-    }
+    std::vector<int> sockets(childSockets.begin(), childSockets.end());
+    std::vector<int> parked(sockets.size(), -1);
     const int count = childSockets.size();
-    worker->process->setChildProcessModifier([sockets, count] {
-        std::array<int, MaxSharedStreams> parked {};
+    worker->process->setChildProcessModifier([sockets = std::move(sockets), parked = std::move(parked), count]() mutable {
         for (int index = 0; index < count; ++index) {
             parked[index] = ::fcntl(sockets[index], F_DUPFD_CLOEXEC, 3 + count);
             if (parked[index] < 0) ::_exit(127);

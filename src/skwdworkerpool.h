@@ -25,6 +25,7 @@ public:
 private:
     struct Worker {
         QByteArray key;
+        quint64 serial = 0;
         QProcess *process = nullptr;
         QList<SkwdVideoItem *> members;
         QByteArray errors;
@@ -44,4 +45,5 @@ private:
     QHash<QByteArray, Worker *> m_workers;
     QHash<SkwdVideoItem *, Worker *> m_membership;
     QSet<QString> m_legacyPapers;
+    quint64 m_nextWorkerSerial = 0;
 };

@@ -25,6 +25,7 @@
 #include <QMouseEvent>
 #include <QSocketNotifier>
 #include <QTimer>
+#include <QUuid>
 #include <QtEndian>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -279,6 +280,7 @@ public:
 
 SkwdVideoItem::SkwdVideoItem(QQuickItem *parent)
     : QQuickItem(parent)
+    , m_streamId(QStringLiteral("skwd-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)))
 {
     setFlag(ItemHasContents, true);
     createProcess();
@@ -309,6 +311,7 @@ void SkwdVideoItem::createProcess()
 
 SkwdVideoItem::~SkwdVideoItem()
 {
+    resetPointer();
     m_destroying = true;
     m_stopping = true;
     if (m_pooled) {
@@ -555,6 +558,7 @@ void SkwdVideoItem::setPaused(bool value)
     m_paused = value;
     emit pausedChanged();
     if (isComponentComplete()) {
+        resetPointer();
         sendPause();
     }
 }
@@ -562,23 +566,43 @@ void SkwdVideoItem::setPaused(bool value)
 void SkwdVideoItem::componentComplete()
 {
     QQuickItem::componentComplete();
+    observeWindow(window());
     restart();
 }
 
 void SkwdVideoItem::itemChange(ItemChange change, const ItemChangeData &value)
 {
     QQuickItem::itemChange(change, value);
+    if (change == ItemVisibleHasChanged && isComponentComplete()) {
+        resetPointer();
+        sendPause();
+    }
     if (change != ItemSceneChange) {
         return;
     }
+    observeWindow(value.window);
+}
+
+void SkwdVideoItem::observeWindow(QQuickWindow *target)
+{
+    if (m_pointerWindow == target) return;
     if (m_pointerWindow) {
+        resetPointer();
         m_pointerWindow->removeEventFilter(this);
     }
-    m_pointerWindow = value.window;
+    disconnect(m_windowVisibility);
+    m_pointerWindow = target;
     if (m_pointerWindow) {
         m_pointerWindow->installEventFilter(this);
         m_pointerTimer.start();
+        m_windowVisibility = connect(m_pointerWindow, &QWindow::visibleChanged, this, [this] {
+            if (isComponentComplete()) {
+                resetPointer();
+                sendPause();
+            }
+        });
     }
+    if (isComponentComplete()) sendPause();
 }
 
 bool SkwdVideoItem::eventFilter(QObject *watched, QEvent *event)
@@ -611,7 +635,8 @@ static quint8 pointerButtonMask(Qt::MouseButtons buttons)
 
 void SkwdVideoItem::sendPointer(const QPointF &scenePosition, Qt::MouseButtons buttons, bool buttonsChanged)
 {
-    if (width() <= 0 || height() <= 0 || !m_process || m_process->state() != QProcess::Running) {
+    if (width() <= 0 || height() <= 0 || streamPaused()
+        || (!m_pooled && (!m_process || m_process->state() != QProcess::Running))) {
         return;
     }
     const QPointF local = mapFromScene(scenePosition);
@@ -619,21 +644,34 @@ void SkwdVideoItem::sendPointer(const QPointF &scenePosition, Qt::MouseButtons b
     const quint16 y = quint16(qBound(0.0, local.y() / height(), 1.0) * 65535.0 + 0.5);
     const quint32 packed = (quint32(x) << 16) | y;
     const quint8 mask = pointerButtonMask(buttons);
-    if (!buttonsChanged && packed == m_pointerLast && mask == m_pointerButtons) {
+    if (!buttonsChanged && m_pointerKnown && packed == m_pointerLast && mask == m_pointerButtons) {
         return;
     }
-    if (!buttonsChanged && m_pointerTimer.isValid() && m_pointerTimer.elapsed() < 16) {
+    if (!buttonsChanged && m_pointerKnown && m_pointerTimer.isValid() && m_pointerTimer.elapsed() < 16) {
         return;
     }
     m_pointerTimer.restart();
     m_pointerLast = packed;
     m_pointerButtons = mask;
+    m_pointerKnown = true;
+    sendPointerState(packed, mask);
+}
+
+void SkwdVideoItem::resetPointer()
+{
+    if (m_pointerButtons) sendPointerState(m_pointerLast, 0);
+    m_pointerButtons = 0;
+    m_pointerKnown = false;
+}
+
+void SkwdVideoItem::sendPointerState(quint32 position, quint8 buttons)
+{
     QJsonObject pointer;
-    pointer.insert(QStringLiteral("x"), int(x));
-    pointer.insert(QStringLiteral("y"), int(y));
-    pointer.insert(QStringLiteral("buttons"), int(mask));
+    pointer.insert(QStringLiteral("x"), int(position >> 16));
+    pointer.insert(QStringLiteral("y"), int(position & 0xffff));
+    pointer.insert(QStringLiteral("buttons"), int(buttons));
     QJsonObject command;
-    command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
+    command.insert(QStringLiteral("to"), m_pooled ? m_streamId : QString());
     command.insert(QStringLiteral("pointer"), pointer);
     const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
     if (m_pooled) {
@@ -669,8 +707,8 @@ void SkwdVideoItem::sendControl(const QByteArray &line)
 void SkwdVideoItem::sendPause()
 {
     QJsonObject command;
-    command.insert(QStringLiteral("to"), m_pooled ? m_output : QString());
-    command.insert(QStringLiteral("pause"), m_paused);
+    command.insert(QStringLiteral("to"), m_pooled ? m_streamId : QString());
+    command.insert(QStringLiteral("pause"), streamPaused());
     const QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact) + '\n';
     if (m_pooled) {
         if (!SkwdWorkerPool::instance()->sendControl(this, line)) {
@@ -684,6 +722,16 @@ void SkwdVideoItem::sendPause()
 QString SkwdVideoItem::output() const
 {
     return m_output;
+}
+
+QString SkwdVideoItem::streamId() const
+{
+    return m_streamId;
+}
+
+bool SkwdVideoItem::streamPaused() const
+{
+    return m_paused || !isVisible() || !window() || !window()->isVisible();
 }
 
 void SkwdVideoItem::setOutput(const QString &value)
@@ -732,7 +780,7 @@ QByteArray SkwdVideoItem::workerKey() const
 {
     QJsonObject assignment = QJsonDocument::fromJson(m_assignment.toUtf8()).object();
     assignment.remove(QStringLiteral("outputs"));
-    return m_paper.toUtf8() + '\n' + m_deviceUuid + '\n'
+    return m_paper.toUtf8() + '\n' + m_deviceUuid + '\n' + m_driverUuid + '\n'
         + QJsonDocument(assignment).toJson(QJsonDocument::Compact);
 }
 
@@ -744,7 +792,7 @@ SkwdVideoItem::StreamSpec SkwdVideoItem::streamSpec() const
     const bool budgeted = cpuFrames
         || (kind == QStringLiteral("video") && source.value(QStringLiteral("engine")).toString() == QStringLiteral("tinier"));
     const QSize size = budgeted ? fitFrameStream(m_streamWidth, m_streamHeight) : QSize(m_streamWidth, m_streamHeight);
-    return {size.width(), size.height(), m_streamFps, m_output, m_paused, cpuFrames};
+    return {size.width(), size.height(), m_streamFps, m_output, m_streamId, streamPaused(), cpuFrames};
 }
 
 int SkwdVideoItem::beginSharedFrames()
@@ -901,7 +949,7 @@ void SkwdVideoItem::restart()
             QStringLiteral("%1x%2").arg(spec.width).arg(spec.height),
             QStringLiteral("--stream-fps"), QString::number(m_streamFps),
             QStringLiteral("--stream-fd"), QStringLiteral("3")};
-    if (m_paused) {
+    if (spec.paused) {
         arguments.append(QStringLiteral("--paused"));
     }
     auto environment = QProcessEnvironment::systemEnvironment();
@@ -920,6 +968,7 @@ void SkwdVideoItem::restart()
 
 void SkwdVideoItem::resetStream()
 {
+    m_pointerKnown = false;
     m_epoch = 0;
     ++m_streamGeneration;
     m_gpuUnavailable = false;

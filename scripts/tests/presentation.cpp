@@ -48,6 +48,10 @@ if mode.startswith('{'):
         sys.stdout.buffer.flush()
         sys.stdin.read()
         sys.exit(0)
+    outputs = json.loads(mode).get('outputs', [])
+    if len(outputs) != len(set(outputs)):
+        sys.stderr.write('output %s appears in more than one assignment\n' % next(value for value in outputs if outputs.count(value) > 1))
+        sys.exit(1)
     size = sys.argv[sys.argv.index('--stream-size') + 1] if '--stream-size' in sys.argv else ''
     with open(runtime + '/shared.log', 'a') as log:
         log.write('spawn %d %s %s %s\n' % (os.getpid(), mode, ' '.join(specs), size))
@@ -253,8 +257,8 @@ sys.stdin.read()
         std::cerr << "expected one shared spawn: " << log.toStdString();
         return 12;
     }
-    if (!spawns.first().contains("fd=3,size=1280x720,fps=30,output=DP-1,paused=0")
-        || !spawns.first().contains("fd=4,size=640x480,fps=30,output=DP-2,paused=0")
+    if (!spawns.first().contains(QString("fd=3,size=1280x720,fps=30,output=%1,paused=0").arg(left.streamId()))
+        || !spawns.first().contains(QString("fd=4,size=640x480,fps=30,output=%1,paused=0").arg(right.streamId()))
         || !spawns.first().contains("\"outputs\":[\"DP-1\",\"DP-2\"]")) {
         std::cerr << "unexpected shared spawn: " << spawns.first().toStdString();
         return 13;
@@ -322,7 +326,7 @@ sys.stdin.read()
         return 48;
     }
     right.setPaused(true);
-    if (!settled([&] { return sharedLog().contains("control {\"pause\":true,\"to\":\"DP-2\"}"); })) {
+    if (!settled([&] { return sharedLog().contains(QString("control {\"pause\":true,\"to\":\"%1\"}").arg(right.streamId())); })) {
         std::cerr << "routed pause missing: " << sharedLog().toStdString();
         return 14;
     }
@@ -530,8 +534,8 @@ sys.stdin.read()
         return 41;
     }
     const auto lockSpawns = sharedLog().split('\n').filter(QStringLiteral("lock.png"));
-    if (lockSpawns.size() != 1 || !lockSpawns.first().contains("size=2560x1440,fps=30,output=DP-8")
-        || !lockSpawns.first().contains("size=2160x3838,fps=30,output=DP-9")) {
+    if (lockSpawns.size() != 1 || !lockSpawns.first().contains(QString("size=2560x1440,fps=30,output=%1").arg(lockWide.streamId()))
+        || !lockSpawns.first().contains(QString("size=2160x3838,fps=30,output=%1").arg(lockPortrait.streamId()))) {
         std::cerr << "still streams must fit the 3840x2160 renderer budget: " << sharedLog().toStdString();
         return 42;
     }
@@ -548,7 +552,7 @@ sys.stdin.read()
         std::cerr << "portrait video never spawned: " << sharedLog().toStdString();
         return 43;
     }
-    if (!sharedLog().contains("size=2880x5120,fps=30,output=DP-10")) {
+    if (!sharedLog().contains(QString("size=2880x5120,fps=30,output=%1").arg(portraitVideo.streamId()))) {
         std::cerr << "GPU video streams keep the portrait output size: " << sharedLog().toStdString();
         return 44;
     }
