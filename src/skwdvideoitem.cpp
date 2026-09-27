@@ -290,6 +290,7 @@ void SkwdVideoItem::createProcess()
 {
     m_process = new QProcess(this);
     m_process->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(m_process, &QProcess::started, this, &SkwdVideoItem::sendPause);
     connect(m_process, &QProcess::readyReadStandardOutput, this, &SkwdVideoItem::consume);
     connect(m_process, &QProcess::readyReadStandardError, this, &SkwdVideoItem::collectErrors);
     connect(m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
