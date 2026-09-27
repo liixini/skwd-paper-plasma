@@ -42,12 +42,14 @@ public:
     void setPaused(bool value);
     QString output() const;
     void setOutput(const QString &value);
+    QString streamId() const;
 
     struct StreamSpec {
         int width = 0;
         int height = 0;
         int fps = 30;
         QString output;
+        QString id;
         bool paused = false;
         bool cpuFrames = false;
     };
@@ -99,9 +101,13 @@ private:
     void resetStream();
     int openStream();
     bool poolEligible() const;
+    bool streamPaused() const;
+    void observeWindow(QQuickWindow *window);
     void sendControl(const QByteArray &line);
     void sendPause();
     void sendPointer(const QPointF &scenePosition, Qt::MouseButtons buttons, bool buttonsChanged);
+    void sendPointerState(quint32 position, quint8 buttons);
+    void resetPointer();
     void consume();
     void consumeFrames(const QByteArray &bytes);
     void readFrames();
@@ -130,6 +136,7 @@ private:
     int m_streamFps = 30;
     bool m_paused = false;
     QString m_output;
+    const QString m_streamId;
     bool m_pooled = false;
     bool m_restartScheduled = false;
     bool m_restartRequired = false;
@@ -164,7 +171,9 @@ private:
     bool m_framePollScheduled = false;
     bool m_lateAcks = false;
     QQuickWindow *m_pointerWindow = nullptr;
+    QMetaObject::Connection m_windowVisibility;
     QElapsedTimer m_pointerTimer;
     quint32 m_pointerLast = 0;
     quint8 m_pointerButtons = 0;
+    bool m_pointerKnown = false;
 };
