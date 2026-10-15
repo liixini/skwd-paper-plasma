@@ -5,7 +5,7 @@
         "Name": "Skwd Paper",
         "Description": "Plasma-native wallpapers rendered by Skwd Paper",
         "Icon": "preferences-desktop-wallpaper",
-        "License": "GPL-3.0-or-later"
+        "License": "MIT"
     },
     "X-KDE-ParentApp": "org.kde.plasmashell"
 }
