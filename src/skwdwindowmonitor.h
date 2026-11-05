@@ -71,6 +71,7 @@ private:
     bool m_paused = false;
     bool m_subscribe = false;
     bool m_capable = false;
+    bool m_focusCapable = false;
     bool m_subscribed = false;
     bool m_hasEntry = false;
     bool m_settled = false;

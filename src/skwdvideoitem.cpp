@@ -46,6 +46,16 @@ constexpr int SlotCount = 3;
 constexpr int MinStreamEdge = 16;
 constexpr int MaxStreamEdge = 8192;
 constexpr qint64 FrameStreamPixels = qint64(3840) * 2160;
+const QString TransitionKey = QStringLiteral("transition");
+const QString DrawingKey = QStringLiteral("drawing");
+const QString StateKey = QStringLiteral("state");
+const QString PendingState = QStringLiteral("pending");
+constexpr qint64 PresentationStatusLimit = 16384;
+
+bool drawingTransition(const QJsonObject &assignment)
+{
+    return assignment.value(TransitionKey).toObject().contains(DrawingKey);
+}
 
 struct ReceivedDescriptor {
     int fd = -1;
@@ -339,10 +349,55 @@ void SkwdVideoItem::setPresentationId(const QString &value)
         scheduleRestart();
     }
     QTimer::singleShot(0, this, [this] {
+        const bool replay = isComponentComplete() && !m_restartRequired && m_assignment == m_presentedAssignment
+            && drawingRequested();
+        m_presentedAssignment = m_assignment;
+        if (replay) {
+            scheduleRestart();
+            return;
+        }
         if (!m_restartRequired) {
             reportPresentation();
         }
     });
+}
+
+QString SkwdVideoItem::presentationPath() const
+{
+    return QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation)
+        + QStringLiteral("/skwd-paper-plasma/") + m_presentationId + QStringLiteral(".json");
+}
+
+bool SkwdVideoItem::drawingRequested() const
+{
+    if (m_presentationId.isEmpty() || m_presentationId == m_drawnPresentation
+        || !drawingTransition(QJsonDocument::fromJson(m_assignment.toUtf8()).object())) {
+        return false;
+    }
+    QFile file(presentationPath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    return QJsonDocument::fromJson(file.read(PresentationStatusLimit)).object().value(StateKey).toString() == PendingState;
+}
+
+bool SkwdVideoItem::takeDrawing()
+{
+    if (!drawingRequested()) {
+        return false;
+    }
+    m_drawnPresentation = m_presentationId;
+    return true;
+}
+
+QString SkwdVideoItem::launchAssignment(const QString &assignment, bool drawing)
+{
+    QJsonObject value = QJsonDocument::fromJson(assignment.toUtf8()).object();
+    if (drawing || !drawingTransition(value)) {
+        return assignment;
+    }
+    value.remove(TransitionKey);
+    return QString::fromUtf8(QJsonDocument(value).toJson(QJsonDocument::Compact));
 }
 
 void SkwdVideoItem::collectErrors()
@@ -377,8 +432,7 @@ void SkwdVideoItem::reportPresentation()
     if (m_error.isEmpty() && (!m_workerReady || !m_frameAccepted)) {
         return;
     }
-    const QString path = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation)
-        + QStringLiteral("/skwd-paper-plasma/") + m_presentationId + QStringLiteral(".json");
+    const QString path = presentationPath();
     if (!QFile::exists(path)) {
         return;
     }
@@ -447,12 +501,13 @@ bool SkwdVideoItem::retune(const QString &previous)
     const QJsonObject before = QJsonDocument::fromJson(previous.toUtf8()).object();
     const QJsonObject after = QJsonDocument::fromJson(m_assignment.toUtf8()).object();
     auto identity = [](QJsonObject assignment) {
-        for (const auto key : {QStringLiteral("transition"), QStringLiteral("mute"), QStringLiteral("volume")}) {
+        for (const auto &key : {TransitionKey, QStringLiteral("mute"), QStringLiteral("volume")}) {
             assignment.remove(key);
         }
         return assignment;
     };
-    if (before.isEmpty() || identity(before) != identity(after)) {
+    if (before.isEmpty() || identity(before) != identity(after)
+        || (drawingTransition(after) && before.value(TransitionKey) != after.value(TransitionKey))) {
         return false;
     }
     const auto kind = after.value(QStringLiteral("source")).toObject().value(QStringLiteral("kind")).toString();
@@ -945,7 +1000,7 @@ void SkwdVideoItem::restart()
     });
     const auto spec = streamSpec();
     QStringList arguments {QStringLiteral("present-plasma"),
-            QStringLiteral("--assignment"), m_assignment,
+            QStringLiteral("--assignment"), launchAssignment(m_assignment, takeDrawing()),
             QStringLiteral("--stream-size"),
             QStringLiteral("%1x%2").arg(spec.width).arg(spec.height),
             QStringLiteral("--stream-fps"), QString::number(m_streamFps),

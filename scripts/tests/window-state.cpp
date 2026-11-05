@@ -10,17 +10,21 @@
 #include <QThread>
 #include <functional>
 #include <memory>
+#include <optional>
 
 class Tasks : public QAbstractListModel {
 public:
-    struct Row { bool fullscreen; bool maximized; bool minimized; };
+    struct Row { bool fullscreen; bool maximized; bool minimized; bool focused = false; };
     QList<Row> rows;
     bool valid = true;
+    bool focusValid = true;
     int rowCount(const QModelIndex &parent = QModelIndex()) const override { return parent.isValid() ? 0 : rows.size(); }
     QHash<int, QByteArray> roleNames() const override {
         if (!valid) return {};
-        return {{Qt::UserRole, "IsWindow"}, {Qt::UserRole + 1, "IsFullScreen"},
-                {Qt::UserRole + 2, "IsMaximized"}, {Qt::UserRole + 3, "IsMinimized"}};
+        QHash<int, QByteArray> roles{{Qt::UserRole, "IsWindow"}, {Qt::UserRole + 1, "IsFullScreen"},
+                                    {Qt::UserRole + 2, "IsMaximized"}, {Qt::UserRole + 3, "IsMinimized"}};
+        if (focusValid) roles.insert(Qt::UserRole + 4, "IsActive");
+        return roles;
     }
     QVariant data(const QModelIndex &index, int role) const override {
         if (!index.isValid() || index.row() >= rows.size()) return {};
@@ -30,6 +34,7 @@ public:
         case 1: return row.fullscreen;
         case 2: return row.maximized;
         case 3: return row.minimized;
+        case 4: return row.focused;
         default: return {};
         }
     }
@@ -46,13 +51,16 @@ static void waitFor(const std::function<bool()> &condition, qint64 timeout = 300
     if (!condition()) qFatal("Window-state condition timed out");
 }
 
-static void expect(QLocalSocket *socket, bool supported, bool fullscreen, bool maximized) {
+static void expect(QLocalSocket *socket, bool supported, bool fullscreen, bool maximized,
+                   std::optional<bool> focused = std::nullopt) {
     waitFor([&] { return socket->canReadLine(); });
     const auto value = QJsonDocument::fromJson(socket->readLine()).object();
     if (value.value("version").toInt() != 1 || value.value("output").toString() != "DP-1"
         || value.value("supported").toBool() != supported
         || value.value("fullscreen").toBool() != fullscreen
-        || value.value("maximized").toBool() != maximized) {
+        || value.value("maximized").toBool() != maximized
+        || value.contains("focused") != focused.has_value()
+        || (focused && value.value("focused").toBool() != *focused)) {
         qFatal("Unexpected window-state observation: %s", qPrintable(QString::fromUtf8(QJsonDocument(value).toJson())));
     }
 }
@@ -74,24 +82,33 @@ static void observations() {
     waitFor([&] { return server.hasPendingConnections(); });
     std::unique_ptr<QLocalSocket> socket(server.nextPendingConnection());
     expect(socket.get(), true, false, false);
-    socket->write("{\"version\":1,\"paused\":true}\n");
+    socket->write("{\"version\":1,\"paused\":true,\"capabilities\":[\"focused\"]}\n");
     socket->flush();
     waitFor([&] { return monitor.hasPolicy() && monitor.paused(); });
+    expect(socket.get(), true, false, false, false);
     socket->write("{\"version\":1,\"paused\":false}\n");
     socket->flush();
     waitFor([&] { return monitor.hasPolicy() && !monitor.paused(); });
     tasks.replace({{true, false, false}, {false, true, false}});
-    expect(socket.get(), true, true, true);
+    expect(socket.get(), true, true, true, false);
     tasks.replace({{true, false, true}, {false, true, false}});
-    expect(socket.get(), true, false, true);
+    expect(socket.get(), true, false, true, false);
     tasks.replace({});
-    expect(socket.get(), true, false, false);
+    expect(socket.get(), true, false, false, false);
+    tasks.replace({{false, false, false, true}});
+    expect(socket.get(), true, false, false, true);
+    tasks.replace({{false, false, false, false}});
+    expect(socket.get(), true, false, false, false);
+    tasks.focusValid = false;
+    tasks.replace({{true, true, false}});
+    expect(socket.get(), true, true, true, std::nullopt);
+    tasks.focusValid = true;
     tasks.valid = false;
     tasks.replace({{true, true, false}});
-    expect(socket.get(), false, false, false);
+    expect(socket.get(), false, false, false, std::nullopt);
     tasks.valid = true;
     tasks.replace({{true, false, false}});
-    expect(socket.get(), true, true, false);
+    expect(socket.get(), true, true, false, false);
     socket.reset();
     server.close();
     waitFor([&] { return !monitor.hasPolicy(); });
@@ -100,7 +117,7 @@ static void observations() {
     socket.reset(server.nextPendingConnection());
     expect(socket.get(), true, true, false);
     monitor.setModel(nullptr);
-    expect(socket.get(), false, false, false);
+    expect(socket.get(), false, false, false, std::nullopt);
 }
 
 struct Session {

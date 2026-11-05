@@ -99,7 +99,12 @@ void SkwdWindowMonitor::receivePolicy()
         m_hasPolicy = true;
         m_paused = value.value("paused").toBool();
         emit policyChanged();
-        if (!value.value("capabilities").toArray().contains(QStringLiteral("assignments"))) {
+        const auto capabilities = value.value("capabilities").toArray();
+        if (!m_focusCapable && capabilities.contains(QStringLiteral("focused"))) {
+            m_focusCapable = true;
+            schedule();
+        }
+        if (!capabilities.contains(QStringLiteral("assignments"))) {
             settle();
             if (m_hasEntry) {
                 m_hasEntry = false;
@@ -179,6 +184,7 @@ void SkwdWindowMonitor::reconnect()
 void SkwdWindowMonitor::lost()
 {
     m_capable = false;
+    m_focusCapable = false;
     m_subscribed = false;
     m_hasPolicy = false;
     emit policyChanged();
@@ -218,26 +224,33 @@ void SkwdWindowMonitor::publish()
     bool supported = false;
     bool fullscreen = false;
     bool maximized = false;
+    bool focused = false;
+    bool focusSupported = false;
     if (m_model) {
         const auto roles = m_model->roleNames();
         const int windowRole = roles.key("IsWindow", -1);
         const int fullscreenRole = roles.key("IsFullScreen", -1);
         const int maximizedRole = roles.key("IsMaximized", -1);
         const int minimizedRole = roles.key("IsMinimized", -1);
+        const int focusedRole = roles.key("IsActive", -1);
         supported = windowRole >= 0 && fullscreenRole >= 0 && maximizedRole >= 0 && minimizedRole >= 0;
+        focusSupported = m_focusCapable && supported && focusedRole >= 0;
         if (supported) {
             for (int row = 0; row < m_model->rowCount(); ++row) {
                 const QModelIndex index = m_model->index(row, 0);
                 if (!m_model->data(index, windowRole).toBool() || m_model->data(index, minimizedRole).toBool()) continue;
                 fullscreen |= m_model->data(index, fullscreenRole).toBool();
                 maximized |= m_model->data(index, maximizedRole).toBool();
+                if (focusSupported) focused |= m_model->data(index, focusedRole).toBool();
             }
         }
     }
-    const QByteArray message = QJsonDocument(QJsonObject{
+    QJsonObject observation{
         {QStringLiteral("version"), 1}, {QStringLiteral("output"), m_output},
         {QStringLiteral("supported"), supported}, {QStringLiteral("fullscreen"), fullscreen},
         {QStringLiteral("maximized"), maximized}
-    }).toJson(QJsonDocument::Compact) + '\n';
+    };
+    if (focusSupported) observation.insert(QStringLiteral("focused"), focused);
+    const QByteArray message = QJsonDocument(observation).toJson(QJsonDocument::Compact) + '\n';
     if (message != m_last && m_socket.write(message) == message.size()) m_last = message;
 }

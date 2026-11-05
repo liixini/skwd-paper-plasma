@@ -58,6 +58,8 @@ public:
     QByteArray sharedImageDevice() const;
     QByteArray sharedImageDriver() const;
     bool sharesWorker() const;
+    bool takeDrawing();
+    static QString launchAssignment(const QString &assignment, bool drawing);
     bool workerReady() const;
     int beginSharedStream();
     int beginSharedFrames();
@@ -117,12 +119,16 @@ private:
     void collectErrors();
     void failPresentation(const QString &error);
     void reportPresentation();
+    QString presentationPath() const;
+    bool drawingRequested() const;
     void frameAccepted();
     void scheduleFramePoll();
     bool slotsExhausted() const;
     void frameFailed(const QString &error);
 
     QString m_presentationId;
+    QString m_presentedAssignment;
+    QString m_drawnPresentation;
     QByteArray m_stderr;
     QString m_error;
     bool m_workerReady = false;

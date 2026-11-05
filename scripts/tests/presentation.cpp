@@ -417,6 +417,65 @@ sys.stdin.read()
         }
         const auto pendingAssignment = lastSpawn("RETUNE-1")["assignment"].toObject();
         if (pendingAssignment["mute"] != false || pendingAssignment["volume"] != 62) return 61;
+        auto drawing = [&](bool mute) {
+            auto value = QJsonDocument::fromJson(assignment("RETUNE-1", "/wall/retune.mp4", mute, 62, true).toUtf8()).object();
+            auto transition = value["transition"].toObject();
+            transition["effect"] = "drawing";
+            transition["drawing"] = QJsonObject {{"artifact", "/cache/drawing/manifest.json"}, {"ink", "rainbow"}};
+            value["transition"] = transition;
+            return QString::fromUtf8(QJsonDocument(value).toJson(QJsonDocument::Compact));
+        };
+        auto pending = [&](const QString &id) {
+            QFile file(runtime.path() + "/skwd-paper-plasma/" + id + ".json");
+            return file.open(QIODevice::WriteOnly) && file.write("{\"state\":\"pending\"}") > 0;
+        };
+        auto drew = [&] {
+            return lastSpawn("RETUNE-1")["assignment"].toObject()["transition"].toObject().contains("drawing");
+        };
+        auto cleared = [&](int volume) {
+            return assignment("RETUNE-1", "/wall/retune.mp4", false, volume);
+        };
+        int spawns = spawnCount();
+        solo.setAssignment(drawing(false));
+        if (!settled([&] { return spawnCount() == spawns + 1 && solo.workerReady(); }) || drew()) {
+            std::cerr << "stale drawing replayed: " << sharedLog().toStdString();
+            return 69;
+        }
+        solo.setPresentationId(QStringLiteral("123-9-0"));
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        if (spawnCount() != spawns + 1) return 70;
+        if (!pending(QStringLiteral("123-9-1"))) return 71;
+        solo.setPresentationId(QStringLiteral("123-9-1"));
+        if (!settled([&] { return spawnCount() == spawns + 2 && solo.workerReady(); }) || !drew()) {
+            std::cerr << "repeated drawing apply did not replay: " << sharedLog().toStdString();
+            return 72;
+        }
+        spawns = spawnCount();
+        if (!pending(QStringLiteral("123-9-2"))) return 73;
+        solo.setPresentationId(QStringLiteral("123-9-2"));
+        solo.setAssignment(cleared(62));
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        if (!settled([&] { return solo.workerReady(); }) || spawnCount() != spawns) {
+            std::cerr << "clearing a played drawing restarted the presenter: " << sharedLog().toStdString();
+            return 74;
+        }
+        if (!pending(QStringLiteral("123-9-3"))) return 75;
+        solo.setPresentationId(QStringLiteral("123-9-3"));
+        solo.setAssignment(drawing(true));
+        if (!settled([&] { return spawnCount() == spawns + 1 && solo.workerReady(); }) || !drew()) {
+            std::cerr << "presentation before drawing assignment lost the drawing: " << sharedLog().toStdString();
+            return 76;
+        }
+        spawns = spawnCount();
+        const int drawnPid = lastSpawn("RETUNE-1")["pid"].toInt();
+        if (!pending(QStringLiteral("123-9-4"))) return 77;
+        solo.setPresentationId(QStringLiteral("123-9-4"));
+        solo.setAssignment(cleared(45));
+        if (!settled([&] { return audioReceived(drawnPid, false, 45); })) return 78;
+        if (spawnCount() != spawns) {
+            std::cerr << "audio change after a drawing replayed it: " << sharedLog().toStdString();
+            return 79;
+        }
     }
     Item still(window.contentItem());
     Item stillTwo(window.contentItem());

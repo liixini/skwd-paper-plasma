@@ -230,7 +230,12 @@ void SkwdWorkerPool::spawn(Worker *worker)
         return;
     }
     auto *lead = worker->members.first();
-    QJsonObject assignment = QJsonDocument::fromJson(lead->assignment().toUtf8()).object();
+    bool drawing = false;
+    for (auto *member : std::as_const(worker->members)) {
+        drawing = member->takeDrawing() || drawing;
+    }
+    QJsonObject assignment = QJsonDocument::fromJson(
+        SkwdVideoItem::launchAssignment(lead->assignment(), drawing).toUtf8()).object();
     assignment.insert(QStringLiteral("outputs"), outputs);
     arguments << QStringLiteral("--assignment")
               << QString::fromUtf8(QJsonDocument(assignment).toJson(QJsonDocument::Compact));
