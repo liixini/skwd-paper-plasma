@@ -7,6 +7,7 @@
 #include <QStandardPaths>
 
 namespace {
+const QString WidgetsKey = QStringLiteral("widgets");
 constexpr qint64 BriefConnectionMs = 1000;
 constexpr int RetryBaseMs = 250;
 constexpr int RetryLimit = 6;
@@ -53,6 +54,7 @@ bool SkwdWindowMonitor::hasPolicy() const { return m_hasPolicy; }
 bool SkwdWindowMonitor::paused() const { return m_paused; }
 bool SkwdWindowMonitor::subscribe() const { return m_subscribe; }
 QVariantMap SkwdWindowMonitor::entry() const { return m_entry; }
+QString SkwdWindowMonitor::widgets() const { return m_widgets; }
 bool SkwdWindowMonitor::hasEntry() const { return m_hasEntry; }
 bool SkwdWindowMonitor::settled() const { return !m_subscribe || m_settled; }
 
@@ -114,6 +116,14 @@ void SkwdWindowMonitor::receivePolicy()
         } else if (!m_capable) {
             m_capable = true;
             requestAssignments();
+        }
+        const auto widgets = value.value(WidgetsKey);
+        if (widgets.isObject()) {
+            const QString scene = QString::fromUtf8(QJsonDocument(widgets.toObject()).toJson(QJsonDocument::Compact));
+            if (scene != m_widgets) {
+                m_widgets = scene;
+                emit widgetsChanged();
+            }
         }
         const auto entry = value.value("entry");
         if (entry.isObject() && (!m_hasEntry || entry.toObject().toVariantMap() != m_entry)) {

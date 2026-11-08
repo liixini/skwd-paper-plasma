@@ -37,15 +37,41 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
+SkwdWidgetSnapshot::~SkwdWidgetSnapshot()
+{
+    if (pixels) ::munmap(pixels, length);
+    if (fd >= 0) ::close(fd);
+}
+
 namespace {
 constexpr int SlotCount = 3;
+constexpr uchar WidgetPacket = 9;
+constexpr quint32 WidgetVersion = 1;
+constexpr quint32 WidgetMaxLayers = 16;
+constexpr size_t WidgetMaxBytes = 16 * 1024 * 1024;
+constexpr size_t WidgetLayerBytes = 24;
+constexpr size_t WidgetPixelBytes = 4;
+constexpr size_t WidgetVersionAt = 8;
+constexpr size_t WidgetCountAt = 12;
+constexpr size_t WidgetWidthAt = 16;
+constexpr size_t WidgetHeightAt = 20;
+constexpr size_t WidgetRevisionAt = 24;
+constexpr size_t WidgetLayerYAt = 4;
+constexpr size_t WidgetLayerWidthAt = 8;
+constexpr size_t WidgetLayerHeightAt = 12;
+constexpr size_t WidgetLayerOffsetAt = 16;
+constexpr int WidgetSeals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+const QString WidgetStreamFds = QStringLiteral("SKWD_PAPER_WIDGET_STREAM_FDS");
 constexpr int MinStreamEdge = 16;
 constexpr int MaxStreamEdge = 8192;
 constexpr qint64 FrameStreamPixels = qint64(3840) * 2160;
+const QString WidgetsKey = QStringLiteral("widgets");
 const QString TransitionKey = QStringLiteral("transition");
 const QString DrawingKey = QStringLiteral("drawing");
 const QString StateKey = QStringLiteral("state");
@@ -104,6 +130,10 @@ public:
 
     ~SkwdFrameNode() override
     {
+        while (auto *child = firstChild()) {
+            removeChildNode(child);
+            delete child;
+        }
         const bool hasContext = QOpenGLContext::currentContext() != nullptr;
         for (auto &slot : textures) {
             if (hasContext && slot.retired) {
@@ -122,6 +152,62 @@ public:
             if (hasContext && slot.image != EGL_NO_IMAGE_KHR && destroyImage) {
                 destroyImage(display, slot.image);
             }
+        }
+    }
+
+    bool showWidgets(const std::shared_ptr<SkwdWidgetSnapshot> &snapshot,
+                     QQuickWindow *window, const QRectF &bounds)
+    {
+        if (widgetGeneration == streamGeneration && widgetRevision == (snapshot ? snapshot->revision : 0)) {
+            placeWidgets(bounds);
+            return true;
+        }
+        std::vector<QSGSimpleTextureNode *> replacement;
+        if (snapshot) {
+            for (const auto &layer : snapshot->layers) {
+                const auto *pixels = static_cast<const uchar *>(snapshot->pixels) + layer.offset;
+                const QImage image(pixels, int(layer.width), int(layer.height),
+                                   int(layer.width * WidgetPixelBytes), QImage::Format_RGBA8888_Premultiplied);
+                if (image.isNull()) {
+                    for (auto *child : replacement) delete child;
+                    return false;
+                }
+                auto *child = new QSGSimpleTextureNode;
+                child->setTexture(window->createTextureFromImage(image));
+                if (!child->texture()) {
+                    delete child;
+                    for (auto *other : replacement) delete other;
+                    return false;
+                }
+                child->setOwnsTexture(true);
+                child->setFiltering(QSGTexture::Linear);
+                replacement.push_back(child);
+            }
+        }
+        while (auto *child = firstChild()) {
+            removeChildNode(child);
+            delete child;
+        }
+        for (auto *child : replacement) appendChildNode(child);
+        widgetSnapshot = snapshot;
+        widgetRevision = snapshot ? snapshot->revision : 0;
+        widgetGeneration = streamGeneration;
+        placeWidgets(bounds);
+        return true;
+    }
+
+    void placeWidgets(const QRectF &bounds)
+    {
+        if (!widgetSnapshot) return;
+        auto *child = firstChild();
+        for (const auto &layer : widgetSnapshot->layers) {
+            if (!child) break;
+            const qreal x = bounds.x() + layer.rect.x() * bounds.width() / widgetSnapshot->target.width();
+            const qreal y = bounds.y() + layer.rect.y() * bounds.height() / widgetSnapshot->target.height();
+            const qreal width = layer.rect.width() * bounds.width() / widgetSnapshot->target.width();
+            const qreal height = layer.rect.height() * bounds.height() / widgetSnapshot->target.height();
+            static_cast<QSGSimpleTextureNode *>(child)->setRect(x, y, width, height);
+            child = child->nextSibling();
         }
     }
 
@@ -284,6 +370,9 @@ public:
     PFNGLWAITSEMAPHOREEXTPROC waitSemaphore = nullptr;
     quint64 generation = 0;
     quint64 streamGeneration = 0;
+    quint64 widgetGeneration = 0;
+    quint64 widgetRevision = 0;
+    std::shared_ptr<SkwdWidgetSnapshot> widgetSnapshot;
     int currentSlot = -1;
 };
 }
@@ -294,6 +383,9 @@ SkwdVideoItem::SkwdVideoItem(QQuickItem *parent)
 {
     setFlag(ItemHasContents, true);
     createProcess();
+    const auto resized = [this] { if (isComponentComplete()) scheduleRestart(); };
+    connect(this, &QQuickItem::widthChanged, this, resized);
+    connect(this, &QQuickItem::heightChanged, this, resized);
 }
 
 void SkwdVideoItem::createProcess()
@@ -301,6 +393,7 @@ void SkwdVideoItem::createProcess()
     m_process = new QProcess(this);
     m_process->setProcessChannelMode(QProcess::SeparateChannels);
     connect(m_process, &QProcess::started, this, &SkwdVideoItem::sendPause);
+    connect(m_process, &QProcess::started, this, &SkwdVideoItem::sendWidgets);
     connect(m_process, &QProcess::readyReadStandardOutput, this, &SkwdVideoItem::consume);
     connect(m_process, &QProcess::readyReadStandardError, this, &SkwdVideoItem::collectErrors);
     connect(m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
@@ -528,6 +621,31 @@ bool SkwdVideoItem::retune(const QString &previous)
         sendControl(line);
     }
     return true;
+}
+
+QString SkwdVideoItem::widgets() const
+{
+    return m_widgets;
+}
+
+void SkwdVideoItem::setWidgets(const QString &value)
+{
+    if (m_widgets == value) return;
+    m_widgets = value;
+    emit widgetsChanged();
+    sendWidgets();
+}
+
+void SkwdVideoItem::sendWidgets()
+{
+    const auto scene = QJsonDocument::fromJson(m_widgets.toUtf8());
+    if (!scene.isObject()) return;
+    const auto line = QJsonDocument(QJsonObject {{WidgetsKey, scene.object()}}).toJson(QJsonDocument::Compact) + '\n';
+    if (m_pooled) {
+        SkwdWorkerPool::instance()->sendControl(this, line);
+    } else if (m_process->state() == QProcess::Running) {
+        sendControl(line);
+    }
 }
 
 QString SkwdVideoItem::paper() const
@@ -847,8 +965,15 @@ SkwdVideoItem::StreamSpec SkwdVideoItem::streamSpec() const
     const bool cpuFrames = kind == QStringLiteral("static");
     const bool budgeted = cpuFrames
         || (kind == QStringLiteral("video") && source.value(QStringLiteral("engine")).toString() == QStringLiteral("tinier"));
-    const QSize size = budgeted ? fitFrameStream(m_streamWidth, m_streamHeight) : QSize(m_streamWidth, m_streamHeight);
-    return {size.width(), size.height(), m_streamFps, m_output, m_streamId, streamPaused(), cpuFrames};
+    const QSize logical(width() > 0 ? qRound(width()) : m_streamWidth,
+                        height() > 0 ? qRound(height()) : m_streamHeight);
+    QSize size(m_streamWidth, m_streamHeight);
+    if (cpuFrames && width() > 0 && height() > 0) {
+        size = logical.scaled(size, Qt::KeepAspectRatio);
+    }
+    if (budgeted) size = fitFrameStream(size.width(), size.height());
+    return {size.width(), size.height(), logical.width(), logical.height(),
+            m_streamFps, m_output, m_streamId, streamPaused(), cpuFrames};
 }
 
 int SkwdVideoItem::beginSharedFrames()
@@ -953,6 +1078,10 @@ void SkwdVideoItem::closeDmabuf()
         slot = {};
     }
     m_pendingSlots.clear();
+    m_widgetSlots.fill({});
+    m_stagedWidgets.fill({});
+    m_widgetStaged.fill(false);
+    m_latestWidgetRevision = 0;
     m_outstandingSlots.fill(false);
     m_ackSlots.fill(false);
 }
@@ -1005,6 +1134,9 @@ void SkwdVideoItem::restart()
             QStringLiteral("%1x%2").arg(spec.width).arg(spec.height),
             QStringLiteral("--stream-fps"), QString::number(m_streamFps),
             QStringLiteral("--stream-fd"), QStringLiteral("3")};
+    arguments << QStringLiteral("--stream-logical")
+              << QStringLiteral("%1x%2").arg(spec.logicalWidth).arg(spec.logicalHeight);
+    if (!spec.output.isEmpty()) arguments << QStringLiteral("--stream-output") << spec.output;
     if (spec.paused) {
         arguments.append(QStringLiteral("--paused"));
     }
@@ -1017,6 +1149,7 @@ void SkwdVideoItem::restart()
         environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DEVICE_UUID"));
         environment.remove(QStringLiteral("SKWD_PAPER_PLASMA_DRIVER_UUID"));
     }
+    environment.insert(WidgetStreamFds, QStringLiteral("3"));
     m_process->setProcessEnvironment(environment);
     m_process->start(m_paper, arguments);
     ::close(childSocket);
@@ -1051,6 +1184,8 @@ void SkwdVideoItem::resetStream()
 
 int SkwdVideoItem::openStream()
 {
+    const auto spec = streamSpec();
+    m_targetSize = QSize(spec.width, spec.height);
     int sockets[2];
     if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
         failPresentation(QStringLiteral("Cannot create the wallpaper frame socket"));
@@ -1062,6 +1197,90 @@ int SkwdVideoItem::openStream()
     m_socketNotifier = new QSocketNotifier(m_socket, QSocketNotifier::Read, this);
     connect(m_socketNotifier, &QSocketNotifier::activated, this, &SkwdVideoItem::consumeDmabuf);
     return sockets[1];
+}
+
+bool SkwdVideoItem::receiveWidgets(const uchar *bytes, int &descriptor)
+{
+    const int slot = bytes[5];
+    const quint32 count = read32(bytes + WidgetCountAt);
+    const quint32 width = read32(bytes + WidgetWidthAt);
+    const quint32 height = read32(bytes + WidgetHeightAt);
+    const quint64 revision = read64(bytes + WidgetRevisionAt);
+    if (slot >= SlotCount || read32(bytes + WidgetVersionAt) != WidgetVersion || count > WidgetMaxLayers
+        || width != quint32(m_targetSize.width()) || height != quint32(m_targetSize.height())
+        || width == 0 || height == 0 || revision == 0) {
+        return false;
+    }
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_outstandingSlots[slot] || m_widgetStaged[slot] || m_slots[slot].width == 0
+            || revision < m_latestWidgetRevision
+            || (m_widgetSlots[slot] && revision <= m_widgetSlots[slot]->revision)) {
+            return false;
+        }
+    }
+    auto snapshot = std::make_shared<SkwdWidgetSnapshot>();
+    snapshot->revision = revision;
+    snapshot->target = QSize(int(width), int(height));
+    if (count == 0) {
+        if (descriptor >= 0) return false;
+    } else {
+        if (descriptor < 0) return false;
+        const int seals = ::fcntl(descriptor, F_GET_SEALS);
+        struct stat info {};
+        if (seals < 0 || (seals & WidgetSeals) != WidgetSeals
+            || ::fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode)
+            || info.st_size <= 0 || quint64(info.st_size) > WidgetMaxBytes) {
+            return false;
+        }
+        const size_t tableBytes = size_t(count) * WidgetLayerBytes;
+        if (size_t(info.st_size) < tableBytes) return false;
+        std::array<uchar, WidgetMaxLayers * WidgetLayerBytes> table {};
+        if (::pread(descriptor, table.data(), tableBytes, 0) != ssize_t(tableBytes)) return false;
+        quint64 offset = tableBytes;
+        snapshot->layers.reserve(count);
+        for (quint32 index = 0; index < count; ++index) {
+            const auto *entry = table.data() + index * WidgetLayerBytes;
+            const quint32 x = read32(entry);
+            const quint32 y = read32(entry + WidgetLayerYAt);
+            const quint32 layerWidth = read32(entry + WidgetLayerWidthAt);
+            const quint32 layerHeight = read32(entry + WidgetLayerHeightAt);
+            const quint64 start = read64(entry + WidgetLayerOffsetAt);
+            if (layerWidth == 0 || layerHeight == 0 || layerWidth > width || layerHeight > height
+                || x > width - layerWidth || y > height - layerHeight || start != offset) {
+                return false;
+            }
+            const quint64 layerBytes = quint64(layerWidth) * layerHeight * WidgetPixelBytes;
+            if (layerBytes > quint64(info.st_size) - offset) return false;
+            snapshot->layers.push_back({QRectF(x, y, layerWidth, layerHeight), layerWidth, layerHeight, offset});
+            offset += layerBytes;
+        }
+        if (offset != quint64(info.st_size)) return false;
+        void *pixels = ::mmap(nullptr, size_t(info.st_size), PROT_READ, MAP_SHARED, descriptor, 0);
+        if (pixels == MAP_FAILED) return false;
+        snapshot->fd = std::exchange(descriptor, -1);
+        snapshot->pixels = pixels;
+        snapshot->length = size_t(info.st_size);
+    }
+    {
+        QMutexLocker lock(&m_frameMutex);
+        m_stagedWidgets[slot] = std::move(snapshot);
+        m_widgetStaged[slot] = true;
+        m_latestWidgetRevision = revision;
+    }
+    pruneWidgetSlots();
+    return true;
+}
+
+void SkwdVideoItem::pruneWidgetSlots()
+{
+    QMutexLocker lock(&m_frameMutex);
+    for (int slot = 0; slot < SlotCount; ++slot) {
+        if (!m_outstandingSlots[slot] && !m_widgetStaged[slot] && m_widgetSlots[slot]
+            && m_widgetSlots[slot]->revision < m_latestWidgetRevision) {
+            m_widgetSlots[slot].reset();
+        }
+    }
 }
 
 void SkwdVideoItem::consumeDmabuf()
@@ -1095,8 +1314,20 @@ void SkwdVideoItem::consumeDmabuf()
             m_socketNotifier->setEnabled(false);
             return;
         }
-        if (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC) || descriptorCount > 1) continue;
+        if (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC) || descriptorCount > 1) {
+            if (length > 4 && bytes[4] == WidgetPacket) {
+                failPresentation(QStringLiteral("Invalid wallpaper widget snapshot"));
+                m_socketNotifier->setEnabled(false);
+                return;
+            }
+            continue;
+        }
         if (length != 32 || std::memcmp(bytes.data(), "SKDG", 4) != 0) {
+            if (length > 4 && bytes[4] == WidgetPacket) {
+                failPresentation(QStringLiteral("Invalid wallpaper widget snapshot"));
+                m_socketNotifier->setEnabled(false);
+                return;
+            }
             continue;
         }
         const quint16 epoch = qFromLittleEndian<quint16>(bytes.data() + 6);
@@ -1108,6 +1339,10 @@ void SkwdVideoItem::consumeDmabuf()
                 slot = {};
             }
             m_pendingSlots.clear();
+            m_widgetSlots.fill({});
+            m_stagedWidgets.fill({});
+            m_widgetStaged.fill(false);
+            m_latestWidgetRevision = 0;
             m_outstandingSlots.fill(false);
             m_ackSlots.fill(false);
             m_frame.clear();
@@ -1123,6 +1358,14 @@ void SkwdVideoItem::consumeDmabuf()
             continue;
         }
         if (epoch != m_epoch) continue;
+        if (bytes[4] == WidgetPacket) {
+            if (!receiveWidgets(bytes.data(), received.fd)) {
+                failPresentation(QStringLiteral("Invalid wallpaper widget snapshot"));
+                m_socketNotifier->setEnabled(false);
+                return;
+            }
+            continue;
+        }
         if (bytes[4] == 6 && length == 32) {
             m_lateAcks = (bytes[8] & 1) != 0;
             m_workerReady = true;
@@ -1151,16 +1394,24 @@ void SkwdVideoItem::consumeDmabuf()
             slot.modifier = read64(bytes.data() + 24);
             slot.opaque = bytes[4] == 4;
         } else if (bytes[4] == 2) {
-            if (m_outstandingSlots[slotIndex]) {
+            bool reused;
+            {
+                QMutexLocker lock(&m_frameMutex);
+                reused = m_outstandingSlots[slotIndex];
+                if (!reused) {
+                    m_outstandingSlots[slotIndex] = true;
+                    if (m_widgetStaged[slotIndex]) {
+                        m_widgetSlots[slotIndex] = std::move(m_stagedWidgets[slotIndex]);
+                        m_widgetStaged[slotIndex] = false;
+                    }
+                    m_pendingSlots.push_back(slotIndex);
+                    ++m_generation;
+                }
+            }
+            if (reused) {
                 failPresentation(QStringLiteral("Wallpaper renderer reused a GPU frame before release"));
                 m_socketNotifier->setEnabled(false);
                 return;
-            }
-            m_outstandingSlots[slotIndex] = true;
-            {
-                QMutexLocker lock(&m_frameMutex);
-                m_pendingSlots.push_back(slotIndex);
-                ++m_generation;
             }
             update();
         }
@@ -1178,9 +1429,13 @@ void SkwdVideoItem::acknowledge(int slot)
     bytes[5] = uchar(slot);
     qToLittleEndian(m_epoch, bytes.data() + 6);
     const ssize_t sent = ::send(m_socket, bytes.data(), bytes.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-    m_ackSlots[slot] = sent != ssize_t(bytes.size());
-    if (m_ackSlots[slot]) scheduleFramePoll();
-    else m_outstandingSlots[slot] = false;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        m_ackSlots[slot] = sent != ssize_t(bytes.size());
+        if (!m_ackSlots[slot]) m_outstandingSlots[slot] = false;
+    }
+    if (sent != ssize_t(bytes.size())) scheduleFramePoll();
+    else pruneWidgetSlots();
 }
 
 void SkwdVideoItem::consume()
@@ -1229,6 +1484,7 @@ void SkwdVideoItem::consumeFrames(const QByteArray &bytes)
 
 bool SkwdVideoItem::slotsExhausted() const
 {
+    QMutexLocker lock(&m_frameMutex);
     return std::all_of(m_outstandingSlots.begin(), m_outstandingSlots.end(), [](bool outstanding) { return outstanding; });
 }
 
@@ -1286,8 +1542,13 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             scheduleRestart();
         }, Qt::QueuedConnection);
     }
+    std::array<bool, SlotCount> retryAcks;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        retryAcks = m_ackSlots;
+    }
     for (int slot = 0; slot < SlotCount; ++slot) {
-        if (m_ackSlots[slot]) acknowledge(slot);
+        if (retryAcks[slot]) acknowledge(slot);
     }
     auto *node = static_cast<SkwdFrameNode *>(oldNode);
     std::vector<int> pendingSlots;
@@ -1314,6 +1575,19 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         node->setFiltering(QSGTexture::Linear);
     }
     node->setRect(boundingRect());
+    node->placeWidgets(boundingRect());
+    const auto needsRetirementPoll = [this, node] {
+        if (!m_lateAcks || slotsExhausted()) return true;
+        QMutexLocker lock(&m_frameMutex);
+        for (int slot = 0; slot < SlotCount; ++slot) {
+            const auto &widgets = m_widgetSlots[slot];
+            if (node->textures[slot].retired && widgets && widgets->length > 0
+                && widgets->revision < m_latestWidgetRevision) {
+                return true;
+            }
+        }
+        return false;
+    };
     bool retiring = false;
     if (node->streamGeneration == m_streamGeneration) {
         for (int slot = 0; slot < SlotCount; ++slot) {
@@ -1329,7 +1603,7 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
             }
         }
     }
-    if (retiring && (!m_lateAcks || slotsExhausted())) scheduleFramePoll();
+    if (retiring && needsRetirementPoll()) scheduleFramePoll();
     if (pending >= 0) {
         for (int slot : pendingSlots) {
             bool imported = false;
@@ -1369,7 +1643,16 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         }
         if (retiring) {
             glFlush();
-            if (!m_lateAcks || slotsExhausted()) scheduleFramePoll();
+            if (needsRetirementPoll()) scheduleFramePoll();
+        }
+        std::shared_ptr<SkwdWidgetSnapshot> widgets;
+        {
+            QMutexLocker lock(&m_frameMutex);
+            widgets = m_widgetSlots[pending];
+        }
+        if (!node->showWidgets(widgets, window(), boundingRect())) {
+            frameFailed(QStringLiteral("Cannot upload the wallpaper widgets"));
+            return presentable(node);
         }
         node->setTexture(node->textures[pending].texture);
         node->setOwnsTexture(false);

@@ -56,8 +56,14 @@ if mode.startswith('{'):
     with open(runtime + '/shared.log', 'a') as log:
         log.write('spawn %d %s %s %s\n' % (os.getpid(), mode, ' '.join(specs), size))
     with open(runtime + '/events.jsonl', 'a') as log:
-        log.write(json.dumps({'kind': 'spawn', 'pid': os.getpid(), 'assignment': json.loads(mode)}) + '\n')
+        log.write(json.dumps({'kind': 'spawn', 'pid': os.getpid(), 'assignment': json.loads(mode), 'args': sys.argv[1:]}) + '\n')
     streams = []
+    if not specs:
+        stream = socket.socket(fileno=int(sys.argv[sys.argv.index('--stream-fd') + 1]))
+        stream.send(b'SKDG' + bytes([6]) + bytes(27))
+        streams.append(stream)
+        sys.stdout.buffer.write(b'SKWP' + struct.pack('<II', 16, 16) + bytes([0, 255, 0, 255]) * 256)
+        sys.stdout.buffer.flush()
     for spec in specs:
         fields = dict(item.split('=') for item in spec.split(','))
         stream = socket.socket(fileno=int(fields['fd']))
@@ -477,6 +483,20 @@ sys.stdin.read()
             return 79;
         }
     }
+    {
+        Item aspect;
+        aspect.setAssignment(QStringLiteral(R"({"source":{"kind":"static","path":"/wall/aspect.png"}})"));
+        aspect.setSize(QSizeF(2560, 1600));
+        aspect.setStreamWidth(1920);
+        aspect.setStreamHeight(1080);
+        const auto spec = aspect.streamSpec();
+        if (spec.width != 1728 || spec.height != 1080
+            || spec.logicalWidth != 2560 || spec.logicalHeight != 1600) return 80;
+        aspect.setSize(QSizeF(0, 0));
+        const auto fallback = aspect.streamSpec();
+        if (fallback.width != 1920 || fallback.height != 1080
+            || fallback.logicalWidth != 1920 || fallback.logicalHeight != 1080) return 81;
+    }
     Item still(window.contentItem());
     Item stillTwo(window.contentItem());
     for (auto *shared : {&still, &stillTwo}) {
@@ -495,6 +515,9 @@ sys.stdin.read()
     }
     still.setPresentationId(stillId);
     stillTwo.setPresentationId(stillTwoId);
+    const QString widgets = QStringLiteral(R"({"widgets":[{"output":"DP-3"}]})");
+    still.setWidgets(widgets);
+    stillTwo.setWidgets(widgets);
     still.setAssignment(QStringLiteral(R"({"outputs":["DP-3"],"source":{"kind":"static","path":"/wall/a.png"}})"));
     stillTwo.setAssignment(QStringLiteral(R"({"outputs":["DP-4"],"source":{"kind":"static","path":"/wall/a.png"}})"));
     auto reported = [&](const QString &id) {
@@ -512,6 +535,103 @@ sys.stdin.read()
         std::cerr << "unexpected still spawn: " << sharedLog().toStdString();
         return 23;
     }
+    if (!stillSpawns.first().contains("connector=DP-3,logical=32x32")
+        || !stillSpawns.first().contains("connector=DP-4,logical=32x32")) return 70;
+    const auto widgetReceived = [&](int pid, const QString &scene, qsizetype after = 0) {
+        const auto expected = QJsonDocument::fromJson(scene.toUtf8()).object();
+        for (const auto &event : events().mid(after)) {
+            if (event["pid"].toInt() == pid && event["command"].toObject()["widgets"].toObject() == expected)
+                return true;
+        }
+        return false;
+    };
+    const int widgetPid = lastSpawn("DP-3")["pid"].toInt();
+    if (!settled([&] { return widgetReceived(widgetPid, widgets); })) return 71;
+    const int beforeWidgets = spawnCount();
+    const QString hidden = QStringLiteral(R"({"widgets":[]})");
+    still.setWidgets(hidden);
+    stillTwo.setWidgets(hidden);
+    if (!settled([&] { return widgetReceived(widgetPid, hidden); })) return 72;
+    const auto beforeDone = events().size();
+    still.setWidgets(widgets);
+    stillTwo.setWidgets(widgets);
+    if (!settled([&] { return widgetReceived(widgetPid, widgets, beforeDone); })) return 73;
+    if (spawnCount() != beforeWidgets) return 74;
+    still.scheduleRestart();
+    if (!settled([&] { return lastSpawn("DP-3")["pid"].toInt() != widgetPid; })) return 75;
+    const int restartedPid = lastSpawn("DP-3")["pid"].toInt();
+    if (!settled([&] { return widgetReceived(restartedPid, widgets); })) return 76;
+    for (const auto &kind : {QStringLiteral("video"), QStringLiteral("we")}) {
+        for (const bool pooled : {false, true}) {
+            Item media(window.contentItem());
+            Item mirror(window.contentItem());
+            const QString output = QStringLiteral("WIDGET-%1-%2").arg(kind).arg(pooled);
+            const QString scene = QStringLiteral(R"({"widgets":[{"output":"%1"}]})").arg(output);
+            media.setSize(QSizeF(2560, 1600));
+            media.setStreamWidth(1920);
+            media.setStreamHeight(1080);
+            media.setPaper(helper.fileName());
+            media.setOutput(output);
+            if (pooled) media.setSharedImageDevice("device", "driver");
+            media.setWidgets(scene);
+            media.setAssignment(QStringLiteral(R"({"outputs":["%1"],"source":{"kind":"%2","path":"/wall/%1"}})").arg(output, kind));
+            const QString other = output + QStringLiteral("-OTHER");
+            if (pooled) {
+                mirror.setSize(QSizeF(1280, 720));
+                mirror.setStreamWidth(640);
+                mirror.setStreamHeight(480);
+                mirror.setPaper(helper.fileName());
+                mirror.setOutput(other);
+                mirror.setSharedImageDevice("device", "driver");
+                mirror.setWidgets(scene);
+                mirror.setAssignment(QStringLiteral(R"({"outputs":["%1"],"source":{"kind":"%2","path":"/wall/%3"}})").arg(other, kind, output));
+                mirror.componentComplete();
+            }
+            media.componentComplete();
+            if (!settled([&] { return media.workerReady() && (!pooled || mirror.workerReady()) && !lastSpawn(output).isEmpty(); })) return 201;
+            const auto spawned = lastSpawn(output);
+            const int pid = spawned["pid"].toInt();
+            if (!settled([&] { return widgetReceived(pid, scene); })) return 202;
+            const auto args = spawned["args"].toArray();
+            if (pooled) {
+                const QString geometry = QStringLiteral("connector=%1,logical=2560x1600").arg(output);
+                const QString otherGeometry = QStringLiteral("connector=%1,logical=1280x720").arg(other);
+                if (!sharedLog().contains(geometry) || !sharedLog().contains(otherGeometry)
+                    || lastSpawn(other)["pid"].toInt() != pid) return 203;
+            } else if (!args.contains("--stream-logical") || !args.contains("2560x1600")
+                       || !args.contains("--stream-output") || !args.contains(output)) {
+                return 204;
+            }
+            media.setWidgets(hidden);
+            if (!settled([&] { return widgetReceived(pid, hidden); })) return 205;
+            const auto afterClear = events().size();
+            media.setWidgets(scene);
+            if (!settled([&] { return widgetReceived(pid, scene, afterClear); })) return 206;
+            media.scheduleRestart();
+            if (!settled([&] { return lastSpawn(output)["pid"].toInt() != pid; })) return 207;
+            const int replayPid = lastSpawn(output)["pid"].toInt();
+            if (!settled([&] { return widgetReceived(replayPid, scene); })) return 208;
+        }
+    }
+    {
+        Item solo(window.contentItem());
+        solo.setSize(QSizeF(2560, 1600));
+        solo.setStreamWidth(1920);
+        solo.setStreamHeight(1080);
+        solo.setPaper(helper.fileName());
+        solo.setWidgets(widgets);
+        solo.setAssignment(QStringLiteral(R"({"outputs":["WIDGET-SOLO"],"source":{"kind":"static","path":"/wall/solo.png"}})"));
+        solo.componentComplete();
+        if (!settled([&] { return solo.workerReady() && !lastSpawn("WIDGET-SOLO").isEmpty(); })) return 77;
+        const auto spawned = lastSpawn("WIDGET-SOLO");
+        const auto args = spawned["args"].toArray();
+        if (!args.contains("--stream-logical") || !args.contains("2560x1600") || !args.contains("1728x1080")) return 82;
+        const int pid = spawned["pid"].toInt();
+        if (!settled([&] { return widgetReceived(pid, widgets); })) return 78;
+        solo.setWidgets(hidden);
+        if (!settled([&] { return widgetReceived(pid, hidden); })) return 79;
+    }
+
     Item transitioned(window.contentItem());
     transitioned.setSize(QSizeF(32, 32));
     transitioned.setPaper(helper.fileName());
@@ -582,6 +702,8 @@ sys.stdin.read()
     }
     lockWide.setOutput(QStringLiteral("DP-8"));
     lockPortrait.setOutput(QStringLiteral("DP-9"));
+    lockWide.setSize(QSizeF(2560, 1440));
+    lockPortrait.setSize(QSizeF(2162, 3841));
     lockWide.setStreamWidth(2560);
     lockWide.setStreamHeight(1440);
     lockPortrait.setStreamWidth(2162);

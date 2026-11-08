@@ -46,6 +46,9 @@ void SkwdWorkerPool::createProcess(Worker *worker)
 {
     worker->process = new QProcess(this);
     worker->process->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(worker->process, &QProcess::started, this, [worker] {
+        for (auto *member : std::as_const(worker->members)) member->sendWidgets();
+    });
     connect(worker->process, &QProcess::readyReadStandardOutput, this, [worker] {
         worker->process->readAllStandardOutput();
     });
@@ -203,6 +206,7 @@ void SkwdWorkerPool::spawn(Worker *worker)
     QStringList arguments {QStringLiteral("present-plasma")};
     QJsonArray outputs;
     QStringList streams;
+    QStringList widgetSockets;
     for (auto *member : std::as_const(worker->members)) {
         const auto spec = member->streamSpec();
         const int child = member->beginSharedStream();
@@ -212,6 +216,8 @@ void SkwdWorkerPool::spawn(Worker *worker)
         QString stream = QStringLiteral("fd=%1,size=%2x%3,fps=%4,output=%5,paused=%6")
             .arg(3 + childSockets.size()).arg(spec.width).arg(spec.height).arg(spec.fps)
             .arg(spec.id).arg(spec.paused ? 1 : 0);
+        stream += QStringLiteral(",connector=%1,logical=%2x%3")
+            .arg(spec.output).arg(spec.logicalWidth).arg(spec.logicalHeight);
         int frames = -1;
         if (spec.cpuFrames) {
             frames = member->beginSharedFrames();
@@ -221,6 +227,7 @@ void SkwdWorkerPool::spawn(Worker *worker)
             }
             stream += QStringLiteral(",frame_fd=%1").arg(4 + childSockets.size());
         }
+        widgetSockets.append(QString::number(3 + childSockets.size()));
         childSockets.append(child);
         if (frames >= 0) childSockets.append(frames);
         if (!outputs.contains(spec.output)) outputs.append(spec.output);
@@ -261,6 +268,7 @@ void SkwdWorkerPool::spawn(Worker *worker)
         lead->sharedImageDevice().isEmpty() ? QStringLiteral("0") : QStringLiteral("1"));
     environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_DEVICE_UUID"), QString::fromLatin1(lead->sharedImageDevice()));
     environment.insert(QStringLiteral("SKWD_PAPER_PLASMA_DRIVER_UUID"), QString::fromLatin1(lead->sharedImageDriver()));
+    environment.insert(QStringLiteral("SKWD_PAPER_WIDGET_STREAM_FDS"), widgetSockets.join(QLatin1Char(',')));
     worker->process->setProcessEnvironment(environment);
     worker->process->start(lead->paper(), arguments);
     for (int socket : childSockets) {

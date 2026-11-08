@@ -46,6 +46,7 @@ WallpaperItem {
     SkwdVideoItem {
         anchors.fill: parent
         output: root.Screen.name
+        widgets: Qt.application.name === "plasmashell" ? windowMonitor.widgets : ""
         presentationId: root.currentAssignment ? (root.currentAssignment.presentationId || "") : ""
         assignment: root.currentAssignment
             ? JSON.stringify(root.currentAssignment.assignment)

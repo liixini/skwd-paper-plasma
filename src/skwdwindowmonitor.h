@@ -16,6 +16,7 @@ class SkwdWindowMonitor : public QObject {
     Q_PROPERTY(bool hasPolicy READ hasPolicy NOTIFY policyChanged)
     Q_PROPERTY(bool paused READ paused NOTIFY policyChanged)
     Q_PROPERTY(bool subscribe READ subscribe WRITE setSubscribe NOTIFY subscribeChanged)
+    Q_PROPERTY(QString widgets READ widgets NOTIFY widgetsChanged)
     Q_PROPERTY(QVariantMap entry READ entry NOTIFY entryChanged)
     Q_PROPERTY(bool hasEntry READ hasEntry NOTIFY entryChanged)
     Q_PROPERTY(bool settled READ settled NOTIFY settledChanged)
@@ -32,6 +33,7 @@ public:
     bool subscribe() const;
     void setSubscribe(bool subscribe);
     QVariantMap entry() const;
+    QString widgets() const;
     bool hasEntry() const;
     bool settled() const;
 
@@ -41,6 +43,7 @@ signals:
     void policyChanged();
     void subscribeChanged();
     void entryChanged();
+    void widgetsChanged();
     void settledChanged();
 
 private:
@@ -63,6 +66,7 @@ private:
     QTimer m_retry;
     QTimer m_grace;
     QVariantMap m_entry;
+    QString m_widgets;
     QElapsedTimer m_connectedAt;
     QByteArray m_last;
     int m_failures = 0;

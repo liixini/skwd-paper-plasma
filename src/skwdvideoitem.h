@@ -5,16 +5,39 @@
 #include <QMutex>
 #include <QProcess>
 #include <QQuickItem>
+#include <QRectF>
+#include <QSize>
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 class QSocketNotifier;
 class SkwdWorkerPool;
 
+struct SkwdWidgetSnapshot {
+    struct Layer {
+        QRectF rect;
+        quint32 width;
+        quint32 height;
+        quint64 offset;
+    };
+
+    ~SkwdWidgetSnapshot();
+
+    int fd = -1;
+    void *pixels = nullptr;
+    size_t length = 0;
+    quint64 revision = 0;
+    QSize target;
+    std::vector<Layer> layers;
+};
+
 class SkwdVideoItem : public QQuickItem {
     Q_OBJECT
     Q_PROPERTY(QString presentationId READ presentationId WRITE setPresentationId NOTIFY presentationIdChanged)
     Q_PROPERTY(QString assignment READ assignment WRITE setAssignment NOTIFY assignmentChanged)
+    Q_PROPERTY(QString widgets READ widgets WRITE setWidgets NOTIFY widgetsChanged)
     Q_PROPERTY(QString paper READ paper WRITE setPaper NOTIFY paperChanged)
     Q_PROPERTY(int streamWidth READ streamWidth WRITE setStreamWidth NOTIFY streamSizeChanged)
     Q_PROPERTY(int streamHeight READ streamHeight WRITE setStreamHeight NOTIFY streamSizeChanged)
@@ -30,6 +53,9 @@ public:
     void setPresentationId(const QString &value);
     QString assignment() const;
     void setAssignment(const QString &value);
+    QString widgets() const;
+    void setWidgets(const QString &value);
+    void sendWidgets();
     QString paper() const;
     void setPaper(const QString &value);
     int streamWidth() const;
@@ -47,6 +73,8 @@ public:
     struct StreamSpec {
         int width = 0;
         int height = 0;
+        int logicalWidth = 0;
+        int logicalHeight = 0;
         int fps = 30;
         QString output;
         QString id;
@@ -69,6 +97,7 @@ public:
 signals:
     void presentationIdChanged();
     void assignmentChanged();
+    void widgetsChanged();
     void paperChanged();
     void streamSizeChanged();
     void streamFpsChanged();
@@ -97,6 +126,7 @@ public:
     void scheduleRestart();
 
 private:
+    friend class WidgetSnapshotTest;
     void createProcess();
     void restart();
     bool retune(const QString &previous);
@@ -114,8 +144,10 @@ private:
     void consumeFrames(const QByteArray &bytes);
     void readFrames();
     void consumeDmabuf();
+    bool receiveWidgets(const uchar *bytes, int &descriptor);
     void closeDmabuf();
     void acknowledge(int slot);
+    void pruneWidgetSlots();
     void collectErrors();
     void failPresentation(const QString &error);
     void reportPresentation();
@@ -136,6 +168,7 @@ private:
     quint64 m_frameQueuedGeneration = 0;
     quint64 m_errorQueuedGeneration = 0;
     QString m_assignment;
+    QString m_widgets;
     QString m_paper = QStringLiteral("/usr/bin/skwd-paper-v2");
     int m_streamWidth = 1280;
     int m_streamHeight = 720;
@@ -155,8 +188,13 @@ private:
     int m_headerHeight = 0;
     int m_frameWidth = 0;
     int m_frameHeight = 0;
-    QMutex m_frameMutex;
+    mutable QMutex m_frameMutex;
     std::array<DmabufSlot, 3> m_slots;
+    std::array<std::shared_ptr<SkwdWidgetSnapshot>, 3> m_widgetSlots;
+    std::array<std::shared_ptr<SkwdWidgetSnapshot>, 3> m_stagedWidgets;
+    std::array<bool, 3> m_widgetStaged {};
+    quint64 m_latestWidgetRevision = 0;
+    QSize m_targetSize;
     std::array<bool, 3> m_outstandingSlots {};
     std::array<bool, 3> m_ackSlots {};
     QSocketNotifier *m_socketNotifier = nullptr;

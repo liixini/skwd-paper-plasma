@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QLocalServer>
 #include <QTemporaryDir>
 #include <QThread>
@@ -264,8 +265,30 @@ static void missingDaemonSettlesAfterGrace() {
     waitFor([&] { return monitor.settled(); }, 5000);
 }
 
+static void widgetsSurviveReconnects() {
+    Session session;
+    const QByteArray shown = R"({"version":1,"paused":false,"capabilities":["focused"],"widgets":{"widgets":[{"output":"DP-1"}]}})";
+    session.socket->write(shown + '\n');
+    session.socket->flush();
+    waitFor([&] { return !session.monitor->widgets().isEmpty(); });
+    const auto scene = session.monitor->widgets();
+    session.socket.reset();
+    session.accept(10000);
+    expect(session.socket.get(), true, true, false);
+    if (session.monitor->widgets() != scene) qFatal("Reconnect dropped widgets");
+    session.socket->write("{\"version\":1,\"paused\":false,\"widgets\":{\"widgets\":[]}}\n");
+    session.socket->flush();
+    waitFor([&] { return session.monitor->widgets() != scene; });
+    if (!QJsonDocument::fromJson(session.monitor->widgets().toUtf8()).object()["widgets"].toArray().isEmpty())
+        qFatal("Editing did not hide widgets");
+    session.socket->write(shown + '\n');
+    session.socket->flush();
+    waitFor([&] { return session.monitor->widgets() == scene; });
+}
+
 int main(int argc, char **argv) {
     QCoreApplication application(argc, argv);
+    widgetsSurviveReconnects();
     observations();
     peerDropWhileListening();
     rejectingPeerIsBounded();
